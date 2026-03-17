@@ -3,7 +3,7 @@ from typing import Optional
 from datetime import datetime, time
 
 
-# ─── Machine Loss (unified) ────────────────────────────────────────────────
+# ─── Machine Loss (self-referencing, dipakai master page tree) ────────────────
 class MachineLossCreate(BaseModel):
     parent_id: Optional[int] = None
     level: int
@@ -20,8 +20,6 @@ class MachineLossCreate(BaseModel):
 
 
 class MachineLossUpdate(BaseModel):
-    parent_id: Optional[int] = None
-    level: Optional[int] = None
     name: Optional[str] = None
     description: Optional[str] = None
     sort_order: Optional[int] = None
@@ -38,18 +36,96 @@ class MachineLossResponse(BaseModel):
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
-
     model_config = {"from_attributes": True}
 
 
 class MachineLossMoveRequest(BaseModel):
-    """Payload untuk drag & drop — pindah node ke parent baru."""
-    new_parent_id: Optional[int]   # None = jadi root (level 1)
+    """Payload drag & drop — pindah node ke parent baru."""
+    new_parent_id: Optional[int]
     new_level: int
     new_sort_order: int
 
 
-# ─── Shift ────────────────────────────────────────────────────────────────
+# ─── Loss Level 1 ────────────────────────────────────────────────────────────
+class LossLevel1Create(BaseModel):
+    name: str
+    description: Optional[str] = None
+    sort_order: int = 0
+
+
+class LossLevel1Update(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class LossLevel1Response(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    sort_order: int
+    is_active: bool
+    created_at: datetime
+    created_by_id: Optional[int]
+    model_config = {"from_attributes": True}
+
+
+# ─── Loss Level 2 ────────────────────────────────────────────────────────────
+class LossLevel2Create(BaseModel):
+    level_1_id: int
+    name: str
+    description: Optional[str] = None
+    sort_order: int = 0
+
+
+class LossLevel2Update(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class LossLevel2Response(BaseModel):
+    id: int
+    level_1_id: int
+    name: str
+    description: Optional[str]
+    sort_order: int
+    is_active: bool
+    created_at: datetime
+    created_by_id: Optional[int]
+    model_config = {"from_attributes": True}
+
+
+# ─── Loss Level 3 ────────────────────────────────────────────────────────────
+class LossLevel3Create(BaseModel):
+    level_2_id: int
+    name: str
+    description: Optional[str] = None
+    sort_order: int = 0
+
+
+class LossLevel3Update(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class LossLevel3Response(BaseModel):
+    id: int
+    level_2_id: int
+    name: str
+    description: Optional[str]
+    sort_order: int
+    is_active: bool
+    created_at: datetime
+    created_by_id: Optional[int]
+    model_config = {"from_attributes": True}
+
+
+# ─── Shift ────────────────────────────────────────────────────────────────────
 class ShiftBase(BaseModel):
     name: str
     time_from: time
@@ -74,11 +150,10 @@ class ShiftResponse(ShiftBase):
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
-
     model_config = {"from_attributes": True}
 
 
-# ─── Feed Code ────────────────────────────────────────────────────────────
+# ─── Feed Code ────────────────────────────────────────────────────────────────
 class FeedCodeBase(BaseModel):
     code: str
     remarks: Optional[str] = None
@@ -99,11 +174,10 @@ class FeedCodeResponse(FeedCodeBase):
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
-
     model_config = {"from_attributes": True}
 
 
-# ─── Line ─────────────────────────────────────────────────────────────────
+# ─── Line ─────────────────────────────────────────────────────────────────────
 class LineBase(BaseModel):
     name: str
     code: Optional[str] = None
@@ -127,11 +201,10 @@ class LineResponse(LineBase):
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
-
     model_config = {"from_attributes": True}
 
 
-# ─── Standard Throughput ──────────────────────────────────────────────────
+# ─── Standard Throughput ──────────────────────────────────────────────────────
 class StandardThroughputBase(BaseModel):
     line_id: int
     feed_code_id: int
@@ -152,11 +225,10 @@ class StandardThroughputResponse(StandardThroughputBase):
     id: int
     created_at: datetime
     created_by_id: Optional[int]
-
     model_config = {"from_attributes": True}
 
 
-# ─── Plant ────────────────────────────────────────────────────────────────
+# ─── Plant ────────────────────────────────────────────────────────────────────
 class PlantCreate(BaseModel):
     name: str
     code: str
@@ -171,5 +243,4 @@ class PlantResponse(BaseModel):
     description: Optional[str]
     is_active: bool
     created_at: datetime
-
     model_config = {"from_attributes": True}

@@ -1,15 +1,32 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+"""
+master.py
+─────────
+Machine Loss data flow:
+  CREATE/UPDATE/DELETE → loss_level_1 / loss_level_2 / loss_level_3
+  PostgreSQL trigger   → machine_losses auto-synced
+  READ tree            → GET /machine-losses  (reads machine_losses)
+
+machine_losses.source_id stores the original loss_level_X.id so we can
+reliably look up the source record without guessing by name.
+"""
+
+from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.db.database import get_plant_db
 from app.core.deps import CurrentUser, CurrentPlant
 from app.models.public import Plant
 from app.models.plant_schema import (
+    LossLevel1, LossLevel2, LossLevel3,
     MachineLoss,
     MasterShift, MasterFeedCode, MasterLine, MasterStandardThroughput,
 )
 from app.schemas.master import (
-    MachineLossCreate, MachineLossUpdate, MachineLossResponse, MachineLossMoveRequest,
+    LossLevel1Create, LossLevel1Update, LossLevel1Response,
+    LossLevel2Create, LossLevel2Update, LossLevel2Response,
+    LossLevel3Create, LossLevel3Update, LossLevel3Response,
+    MachineLossResponse, MachineLossMoveRequest,
     ShiftCreate, ShiftUpdate, ShiftResponse,
     FeedCodeCreate, FeedCodeUpdate, FeedCodeResponse,
     LineCreate, LineUpdate, LineResponse,
@@ -23,13 +40,306 @@ def _db(plant: Plant) -> Session:
     return next(get_plant_db(plant.schema_name))
 
 
+def _get_ml(db: Session, ml_id: int) -> MachineLoss:
+    ml = db.query(MachineLoss).filter(
+        MachineLoss.id == ml_id, MachineLoss.is_active == True
+    ).first()
+    if not ml:
+        raise HTTPException(status_code=404, detail=f"Node {ml_id} not found in machine_losses")
+    return ml
+
+
+def _ensure_source_id_column(db: Session, schema_name: str):
+    """Add source_id column to machine_losses if it doesn't exist yet."""
+    try:
+        db.execute(text(f'ALTER TABLE "{schema_name}".machine_losses ADD COLUMN IF NOT EXISTS source_id INTEGER'))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+# ─── Resolve source record from machine_losses ───────────────────────────────
+def _get_source_l1(db: Session, ml: MachineLoss) -> LossLevel1 | None:
+    """Get the loss_level_1 record that corresponds to this machine_losses node."""
+    sid = getattr(ml, "source_id", None)
+    if sid:
+        return db.query(LossLevel1).filter(LossLevel1.id == sid).first()
+    # Fallback: match by name (for rows without source_id)
+    return db.query(LossLevel1).filter(
+        LossLevel1.name == ml.name, LossLevel1.is_active == True
+    ).first()
+
+
+def _get_source_l2(db: Session, ml: MachineLoss) -> LossLevel2 | None:
+    sid = getattr(ml, "source_id", None)
+    if sid:
+        return db.query(LossLevel2).filter(LossLevel2.id == sid).first()
+    return db.query(LossLevel2).filter(
+        LossLevel2.name == ml.name, LossLevel2.is_active == True
+    ).first()
+
+
+def _get_source_l3(db: Session, ml: MachineLoss) -> LossLevel3 | None:
+    sid = getattr(ml, "source_id", None)
+    if sid:
+        return db.query(LossLevel3).filter(LossLevel3.id == sid).first()
+    return db.query(LossLevel3).filter(
+        LossLevel3.name == ml.name, LossLevel3.is_active == True
+    ).first()
+
+
+def _set_source_id(db: Session, ml: MachineLoss, source_id: int):
+    """Persist source_id on the machine_losses row."""
+    try:
+        db.execute(
+            text(f'UPDATE "{ml.__table__.schema or ""}"."machine_losses" SET source_id = :sid WHERE id = :id'),
+            {"sid": source_id, "id": ml.id}
+        )
+    except Exception:
+        pass  # column may not exist yet on very old DBs
+
+
 # ════════════════════════════════════════════════════════
-# MACHINE LOSS  (unified self-referencing)
+# LOSS LEVEL 1
+# ════════════════════════════════════════════════════════
+
+@router.get("/loss-level-1", response_model=list[LossLevel1Response])
+def list_level1(current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    return db.query(LossLevel1).filter(LossLevel1.is_active == True).order_by(LossLevel1.sort_order, LossLevel1.id).all()
+
+
+@router.post("/loss-level-1", response_model=LossLevel1Response, status_code=201)
+def create_level1(payload: LossLevel1Create, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    count = db.query(LossLevel1).filter(LossLevel1.is_active == True).count()
+    item = LossLevel1(
+        name=payload.name, description=payload.description,
+        sort_order=payload.sort_order or count,
+        created_by_id=current_user.id,
+    )
+    db.add(item); db.commit(); db.refresh(item)
+    # Backfill source_id on the machine_losses row created by trigger
+    ml = db.query(MachineLoss).filter(
+        MachineLoss.name == item.name, MachineLoss.level == 1, MachineLoss.is_active == True
+    ).first()
+    if ml:
+        _set_source_id(db, ml, item.id)
+        db.commit()
+    return item
+
+
+@router.put("/loss-level-1/{item_id}", response_model=LossLevel1Response)
+def update_level1(item_id: int, payload: LossLevel1Update, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    # item_id may be loss_level_1.id or machine_losses.id
+    item = db.query(LossLevel1).filter(LossLevel1.id == item_id).first()
+    if not item:
+        ml = db.query(MachineLoss).filter(MachineLoss.id == item_id, MachineLoss.level == 1).first()
+        if ml:
+            item = _get_source_l1(db, ml)
+    if not item:
+        raise HTTPException(status_code=404, detail="Loss Level 1 not found")
+    for k, v in payload.model_dump(exclude_none=True).items():
+        setattr(item, k, v)
+    item.updated_by_id = current_user.id
+    db.commit(); db.refresh(item)
+    return item
+
+
+@router.delete("/loss-level-1/{item_id}", status_code=204)
+def delete_level1(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(LossLevel1).filter(LossLevel1.id == item_id).first()
+    if not item:
+        ml = db.query(MachineLoss).filter(MachineLoss.id == item_id, MachineLoss.level == 1).first()
+        if ml:
+            item = _get_source_l1(db, ml)
+    if not item:
+        raise HTTPException(status_code=404, detail="Loss Level 1 not found")
+    if db.query(LossLevel2).filter(LossLevel2.level_1_id == item.id, LossLevel2.is_active == True).first():
+        raise HTTPException(status_code=400, detail="Remove Level 2 items first")
+    item.is_active = False; item.updated_by_id = current_user.id
+    db.commit()
+
+
+# ════════════════════════════════════════════════════════
+# LOSS LEVEL 2
+# ════════════════════════════════════════════════════════
+
+@router.get("/loss-level-2", response_model=list[LossLevel2Response])
+def list_level2(current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    return db.query(LossLevel2).filter(LossLevel2.is_active == True).order_by(LossLevel2.level_1_id, LossLevel2.sort_order, LossLevel2.id).all()
+
+
+@router.post("/loss-level-2", response_model=LossLevel2Response, status_code=201)
+def create_level2(payload: LossLevel2Create, current_user: CurrentUser, plant: CurrentPlant):
+    """
+    level_1_id = machine_losses.id of the L1 parent.
+    Backend resolves it to the real loss_level_1.id.
+    """
+    db = _db(plant)
+    # Resolve: is it a machine_losses.id or a direct loss_level_1.id?
+    real_l1_id: int | None = None
+
+    ml_parent = db.query(MachineLoss).filter(
+        MachineLoss.id == payload.level_1_id, MachineLoss.level == 1, MachineLoss.is_active == True
+    ).first()
+    if ml_parent:
+        src = _get_source_l1(db, ml_parent)
+        if src:
+            real_l1_id = src.id
+
+    if real_l1_id is None:
+        direct = db.query(LossLevel1).filter(LossLevel1.id == payload.level_1_id, LossLevel1.is_active == True).first()
+        if direct:
+            real_l1_id = direct.id
+
+    if real_l1_id is None:
+        raise HTTPException(status_code=404, detail="Loss Level 1 parent not found")
+
+    count = db.query(LossLevel2).filter(LossLevel2.level_1_id == real_l1_id, LossLevel2.is_active == True).count()
+    item = LossLevel2(
+        level_1_id=real_l1_id, name=payload.name,
+        description=payload.description,
+        sort_order=payload.sort_order or count,
+        created_by_id=current_user.id,
+    )
+    db.add(item); db.commit(); db.refresh(item)
+    # Backfill source_id
+    ml = db.query(MachineLoss).filter(
+        MachineLoss.name == item.name, MachineLoss.level == 2, MachineLoss.is_active == True
+    ).first()
+    if ml:
+        _set_source_id(db, ml, item.id)
+        db.commit()
+    return item
+
+
+@router.put("/loss-level-2/{item_id}", response_model=LossLevel2Response)
+def update_level2(item_id: int, payload: LossLevel2Update, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(LossLevel2).filter(LossLevel2.id == item_id).first()
+    if not item:
+        ml = db.query(MachineLoss).filter(MachineLoss.id == item_id, MachineLoss.level == 2).first()
+        if ml:
+            item = _get_source_l2(db, ml)
+    if not item:
+        raise HTTPException(status_code=404, detail="Loss Level 2 not found")
+    for k, v in payload.model_dump(exclude_none=True).items():
+        setattr(item, k, v)
+    item.updated_by_id = current_user.id
+    db.commit(); db.refresh(item)
+    return item
+
+
+@router.delete("/loss-level-2/{item_id}", status_code=204)
+def delete_level2(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(LossLevel2).filter(LossLevel2.id == item_id).first()
+    if not item:
+        ml = db.query(MachineLoss).filter(MachineLoss.id == item_id, MachineLoss.level == 2).first()
+        if ml:
+            item = _get_source_l2(db, ml)
+    if not item:
+        raise HTTPException(status_code=404, detail="Loss Level 2 not found")
+    if db.query(LossLevel3).filter(LossLevel3.level_2_id == item.id, LossLevel3.is_active == True).first():
+        raise HTTPException(status_code=400, detail="Remove Level 3 items first")
+    item.is_active = False; item.updated_by_id = current_user.id
+    db.commit()
+
+
+# ════════════════════════════════════════════════════════
+# LOSS LEVEL 3
+# ════════════════════════════════════════════════════════
+
+@router.get("/loss-level-3", response_model=list[LossLevel3Response])
+def list_level3(current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    return db.query(LossLevel3).filter(LossLevel3.is_active == True).order_by(LossLevel3.level_2_id, LossLevel3.sort_order, LossLevel3.id).all()
+
+
+@router.post("/loss-level-3", response_model=LossLevel3Response, status_code=201)
+def create_level3(payload: LossLevel3Create, current_user: CurrentUser, plant: CurrentPlant):
+    """
+    level_2_id = machine_losses.id of the L2 parent.
+    Backend resolves it to the real loss_level_2.id.
+    """
+    db = _db(plant)
+    real_l2_id: int | None = None
+
+    ml_parent = db.query(MachineLoss).filter(
+        MachineLoss.id == payload.level_2_id, MachineLoss.level == 2, MachineLoss.is_active == True
+    ).first()
+    if ml_parent:
+        src = _get_source_l2(db, ml_parent)
+        if src:
+            real_l2_id = src.id
+
+    if real_l2_id is None:
+        direct = db.query(LossLevel2).filter(LossLevel2.id == payload.level_2_id, LossLevel2.is_active == True).first()
+        if direct:
+            real_l2_id = direct.id
+
+    if real_l2_id is None:
+        raise HTTPException(status_code=404, detail="Loss Level 2 parent not found")
+
+    count = db.query(LossLevel3).filter(LossLevel3.level_2_id == real_l2_id, LossLevel3.is_active == True).count()
+    item = LossLevel3(
+        level_2_id=real_l2_id, name=payload.name,
+        description=payload.description,
+        sort_order=payload.sort_order or count,
+        created_by_id=current_user.id,
+    )
+    db.add(item); db.commit(); db.refresh(item)
+    # Backfill source_id
+    ml = db.query(MachineLoss).filter(
+        MachineLoss.name == item.name, MachineLoss.level == 3, MachineLoss.is_active == True
+    ).first()
+    if ml:
+        _set_source_id(db, ml, item.id)
+        db.commit()
+    return item
+
+
+@router.put("/loss-level-3/{item_id}", response_model=LossLevel3Response)
+def update_level3(item_id: int, payload: LossLevel3Update, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(LossLevel3).filter(LossLevel3.id == item_id).first()
+    if not item:
+        ml = db.query(MachineLoss).filter(MachineLoss.id == item_id, MachineLoss.level == 3).first()
+        if ml:
+            item = _get_source_l3(db, ml)
+    if not item:
+        raise HTTPException(status_code=404, detail="Loss Level 3 not found")
+    for k, v in payload.model_dump(exclude_none=True).items():
+        setattr(item, k, v)
+    item.updated_by_id = current_user.id
+    db.commit(); db.refresh(item)
+    return item
+
+
+@router.delete("/loss-level-3/{item_id}", status_code=204)
+def delete_level3(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(LossLevel3).filter(LossLevel3.id == item_id).first()
+    if not item:
+        ml = db.query(MachineLoss).filter(MachineLoss.id == item_id, MachineLoss.level == 3).first()
+        if ml:
+            item = _get_source_l3(db, ml)
+    if not item:
+        raise HTTPException(status_code=404, detail="Loss Level 3 not found")
+    item.is_active = False; item.updated_by_id = current_user.id
+    db.commit()
+
+
+# ════════════════════════════════════════════════════════
+# MACHINE LOSSES  (read aggregation, handle cross-level drag)
 # ════════════════════════════════════════════════════════
 
 @router.get("/machine-losses", response_model=list[MachineLossResponse])
 def list_machine_losses(current_user: CurrentUser, plant: CurrentPlant):
-    """Return all ACTIVE machine loss nodes (flat list, sorted by sort_order)."""
     db = _db(plant)
     return (
         db.query(MachineLoss)
@@ -39,112 +349,60 @@ def list_machine_losses(current_user: CurrentUser, plant: CurrentPlant):
     )
 
 
-@router.post("/machine-losses", response_model=MachineLossResponse, status_code=201)
-def create_machine_loss(payload: MachineLossCreate, current_user: CurrentUser, plant: CurrentPlant):
-    db = _db(plant)
-    # Validate parent exists and level is consistent
-    if payload.parent_id:
-        parent = db.query(MachineLoss).filter(
-            MachineLoss.id == payload.parent_id,
-            MachineLoss.is_active == True,
-        ).first()
-        if not parent:
-            raise HTTPException(status_code=404, detail="Parent tidak ditemukan")
-        if payload.level != parent.level + 1:
-            raise HTTPException(status_code=400, detail=f"Level harus {parent.level + 1} untuk parent ini")
-    else:
-        if payload.level != 1:
-            raise HTTPException(status_code=400, detail="Node tanpa parent harus level 1")
-
-    item = MachineLoss(**payload.model_dump(), created_by_id=current_user.id)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return item
-
-
-@router.put("/machine-losses/{item_id}", response_model=MachineLossResponse)
-def update_machine_loss(
-    item_id: int, payload: MachineLossUpdate,
-    current_user: CurrentUser, plant: CurrentPlant,
-):
-    db = _db(plant)
-    item = db.query(MachineLoss).filter(MachineLoss.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Machine loss tidak ditemukan")
-    for k, v in payload.model_dump(exclude_none=True).items():
-        setattr(item, k, v)
-    item.updated_by_id = current_user.id
-    db.commit()
-    db.refresh(item)
-    return item
-
-
-@router.patch("/machine-losses/{item_id}/move", response_model=MachineLossResponse)
+@router.patch("/machine-losses/{ml_id}/move", response_model=MachineLossResponse)
 def move_machine_loss(
-    item_id: int, payload: MachineLossMoveRequest,
-    current_user: CurrentUser, plant: CurrentPlant,
+    ml_id: int,
+    payload: MachineLossMoveRequest,
+    current_user: CurrentUser,
+    plant: CurrentPlant,
 ):
     """
-    Drag & drop endpoint.
-    Move a node to a new parent without changing its ID.
-    Also updates level and sort_order.
+    L3 reparent: move an L3 node to a different L2 parent.
+    Only operation: UPDATE loss_level_3.level_2_id → trigger updates machine_losses.
+    No insert, no delete, no level change.
     """
     db = _db(plant)
-    item = db.query(MachineLoss).filter(MachineLoss.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Machine loss tidak ditemukan")
+    ml = _get_ml(db, ml_id)
 
-    # Guard: cannot move into own subtree
-    if payload.new_parent_id:
-        parent = db.query(MachineLoss).filter(MachineLoss.id == payload.new_parent_id).first()
-        if not parent:
-            raise HTTPException(status_code=404, detail="Parent baru tidak ditemukan")
-        if payload.new_level != parent.level + 1:
-            raise HTTPException(status_code=400, detail="Level tidak konsisten dengan parent baru")
-        # Check not moving into own descendant
-        ancestor_id = parent.parent_id
-        while ancestor_id:
-            if ancestor_id == item_id:
-                raise HTTPException(status_code=400, detail="Tidak bisa memindah node ke dalam subtree-nya sendiri")
-            anc = db.query(MachineLoss).filter(MachineLoss.id == ancestor_id).first()
-            ancestor_id = anc.parent_id if anc else None
-    else:
-        if payload.new_level != 1:
-            raise HTTPException(status_code=400, detail="Node tanpa parent harus level 1")
+    if ml.level != 3:
+        raise HTTPException(status_code=400, detail="Only Level 3 nodes can be moved")
 
-    item.parent_id   = payload.new_parent_id
-    item.level       = payload.new_level
-    item.sort_order  = payload.new_sort_order
-    item.updated_by_id = current_user.id
+    if payload.new_parent_id is None:
+        raise HTTPException(status_code=400, detail="Level 3 requires a parent")
+
+    # Validate new parent is L2
+    new_parent_ml = db.query(MachineLoss).filter(
+        MachineLoss.id == payload.new_parent_id,
+        MachineLoss.is_active == True,
+    ).first()
+    if not new_parent_ml:
+        raise HTTPException(status_code=404, detail="New parent node not found")
+    if new_parent_ml.level != 2:
+        raise HTTPException(status_code=400, detail="L3 can only be moved under an L2 parent")
+
+    # Get the real loss_level_2.id for the new parent
+    new_parent_l2 = _get_source_l2(db, new_parent_ml)
+    if not new_parent_l2:
+        raise HTTPException(status_code=404, detail=f"Could not find loss_level_2 record for '{new_parent_ml.name}'")
+
+    # Get the L3 source record and update its level_2_id
+    l3_src = _get_source_l3(db, ml)
+    if not l3_src:
+        raise HTTPException(status_code=404, detail=f"Could not find loss_level_3 record for '{ml.name}'")
+
+    # UPDATE loss_level_3.level_2_id → trigger will update machine_losses.parent_id automatically
+    l3_src.level_2_id     = new_parent_l2.id
+    l3_src.sort_order     = payload.new_sort_order
+    l3_src.updated_by_id  = current_user.id
+    db.flush()
+
+    # Also update machine_losses directly to make sure parent_id is correct
+    ml.parent_id    = payload.new_parent_id
+    ml.sort_order   = payload.new_sort_order
+    ml.updated_by_id = current_user.id
     db.commit()
-    db.refresh(item)
-    return item
-
-
-@router.delete("/machine-losses/{item_id}", status_code=204)
-def delete_machine_loss(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
-    """Soft delete — set is_active = False. Also soft-deletes all descendants."""
-    db = _db(plant)
-    item = db.query(MachineLoss).filter(MachineLoss.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Machine loss tidak ditemukan")
-
-    # Recursively soft-delete all descendants
-    def soft_delete_tree(node_id: int):
-        children = db.query(MachineLoss).filter(
-            MachineLoss.parent_id == node_id,
-            MachineLoss.is_active == True,
-        ).all()
-        for child in children:
-            soft_delete_tree(child.id)
-            child.is_active = False
-            child.updated_by_id = current_user.id
-
-    soft_delete_tree(item_id)
-    item.is_active = False
-    item.updated_by_id = current_user.id
-    db.commit()
+    db.refresh(ml)
+    return ml
 
 
 # ════════════════════════════════════════════════════════
@@ -161,9 +419,7 @@ def get_shifts(current_user: CurrentUser, plant: CurrentPlant):
 def create_shift(payload: ShiftCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
     item = MasterShift(**payload.model_dump(), created_by_id=current_user.id)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
+    db.add(item); db.commit(); db.refresh(item)
     return item
 
 
@@ -171,26 +427,18 @@ def create_shift(payload: ShiftCreate, current_user: CurrentUser, plant: Current
 def update_shift(item_id: int, payload: ShiftUpdate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
     item = db.query(MasterShift).filter(MasterShift.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Shift tidak ditemukan")
-    for k, v in payload.model_dump(exclude_none=True).items():
-        setattr(item, k, v)
-    item.updated_by_id = current_user.id
-    db.commit()
-    db.refresh(item)
+    if not item: raise HTTPException(status_code=404, detail="Shift not found")
+    for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
+    item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
 
 
 @router.delete("/shifts/{item_id}", status_code=204)
 def delete_shift(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
-    """Soft delete."""
     db = _db(plant)
     item = db.query(MasterShift).filter(MasterShift.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Shift tidak ditemukan")
-    item.is_active = False
-    item.updated_by_id = current_user.id
-    db.commit()
+    if not item: raise HTTPException(status_code=404, detail="Shift not found")
+    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
 
 
 # ════════════════════════════════════════════════════════
@@ -206,15 +454,10 @@ def get_feed_codes(current_user: CurrentUser, plant: CurrentPlant):
 @router.post("/feed-codes", response_model=FeedCodeResponse, status_code=201)
 def create_feed_code(payload: FeedCodeCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    existing = db.query(MasterFeedCode).filter(
-        MasterFeedCode.code == payload.code, MasterFeedCode.is_active == True
-    ).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Feed code sudah ada")
+    if db.query(MasterFeedCode).filter(MasterFeedCode.code == payload.code, MasterFeedCode.is_active == True).first():
+        raise HTTPException(status_code=400, detail="Feed code already exists")
     item = MasterFeedCode(**payload.model_dump(), created_by_id=current_user.id)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
+    db.add(item); db.commit(); db.refresh(item)
     return item
 
 
@@ -222,26 +465,18 @@ def create_feed_code(payload: FeedCodeCreate, current_user: CurrentUser, plant: 
 def update_feed_code(item_id: int, payload: FeedCodeUpdate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
     item = db.query(MasterFeedCode).filter(MasterFeedCode.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Feed code tidak ditemukan")
-    for k, v in payload.model_dump(exclude_none=True).items():
-        setattr(item, k, v)
-    item.updated_by_id = current_user.id
-    db.commit()
-    db.refresh(item)
+    if not item: raise HTTPException(status_code=404, detail="Feed code not found")
+    for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
+    item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
 
 
 @router.delete("/feed-codes/{item_id}", status_code=204)
 def delete_feed_code(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
-    """Soft delete."""
     db = _db(plant)
     item = db.query(MasterFeedCode).filter(MasterFeedCode.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Feed code tidak ditemukan")
-    item.is_active = False
-    item.updated_by_id = current_user.id
-    db.commit()
+    if not item: raise HTTPException(status_code=404, detail="Feed code not found")
+    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
 
 
 # ════════════════════════════════════════════════════════
@@ -258,9 +493,7 @@ def get_lines(current_user: CurrentUser, plant: CurrentPlant):
 def create_line(payload: LineCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
     item = MasterLine(**payload.model_dump(), plant_id=plant.id, created_by_id=current_user.id)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
+    db.add(item); db.commit(); db.refresh(item)
     return item
 
 
@@ -268,26 +501,18 @@ def create_line(payload: LineCreate, current_user: CurrentUser, plant: CurrentPl
 def update_line(item_id: int, payload: LineUpdate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
     item = db.query(MasterLine).filter(MasterLine.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Line tidak ditemukan")
-    for k, v in payload.model_dump(exclude_none=True).items():
-        setattr(item, k, v)
-    item.updated_by_id = current_user.id
-    db.commit()
-    db.refresh(item)
+    if not item: raise HTTPException(status_code=404, detail="Line not found")
+    for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
+    item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
 
 
 @router.delete("/lines/{item_id}", status_code=204)
 def delete_line(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
-    """Soft delete."""
     db = _db(plant)
     item = db.query(MasterLine).filter(MasterLine.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Line tidak ditemukan")
-    item.is_active = False
-    item.updated_by_id = current_user.id
-    db.commit()
+    if not item: raise HTTPException(status_code=404, detail="Line not found")
+    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
 
 
 # ════════════════════════════════════════════════════════
@@ -303,42 +528,29 @@ def get_standard_throughputs(current_user: CurrentUser, plant: CurrentPlant):
 @router.post("/standard-throughputs", response_model=StandardThroughputResponse, status_code=201)
 def create_standard_throughput(payload: StandardThroughputCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    existing = db.query(MasterStandardThroughput).filter(
+    if db.query(MasterStandardThroughput).filter(
         MasterStandardThroughput.line_id == payload.line_id,
         MasterStandardThroughput.feed_code_id == payload.feed_code_id,
-    ).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Kombinasi line + feed code sudah ada")
+    ).first():
+        raise HTTPException(status_code=400, detail="Line + feed code combination already exists")
     item = MasterStandardThroughput(**payload.model_dump(), created_by_id=current_user.id)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
+    db.add(item); db.commit(); db.refresh(item)
     return item
 
 
 @router.put("/standard-throughputs/{item_id}", response_model=StandardThroughputResponse)
-def update_standard_throughput(
-    item_id: int, payload: StandardThroughputUpdate,
-    current_user: CurrentUser, plant: CurrentPlant,
-):
+def update_standard_throughput(item_id: int, payload: StandardThroughputUpdate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
     item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Standard throughput tidak ditemukan")
-    for k, v in payload.model_dump(exclude_none=True).items():
-        setattr(item, k, v)
-    item.updated_by_id = current_user.id
-    db.commit()
-    db.refresh(item)
+    if not item: raise HTTPException(status_code=404, detail="Standard throughput not found")
+    for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
+    item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
 
 
 @router.delete("/standard-throughputs/{item_id}", status_code=204)
 def delete_standard_throughput(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
-    """Hard delete — throughput tidak punya soft delete."""
     db = _db(plant)
     item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Standard throughput tidak ditemukan")
-    db.delete(item)
-    db.commit()
+    if not item: raise HTTPException(status_code=404, detail="Standard throughput not found")
+    db.delete(item); db.commit()
