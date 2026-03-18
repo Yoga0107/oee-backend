@@ -182,6 +182,7 @@ class LineBase(BaseModel):
     name: str
     code: Optional[str] = None
     remarks: Optional[str] = None
+    current_feed_code_id: Optional[int] = None
 
 
 class LineCreate(LineBase):
@@ -192,7 +193,13 @@ class LineUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     remarks: Optional[str] = None
+    current_feed_code_id: Optional[int] = None
     is_active: Optional[bool] = None
+
+
+class LineFeedCodeUpdate(BaseModel):
+    """Khusus untuk mengganti kode pakan aktif pada sebuah line."""
+    current_feed_code_id: Optional[int] = None  # None = hapus kode pakan
 
 
 class LineResponse(LineBase):
@@ -201,6 +208,8 @@ class LineResponse(LineBase):
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
+    # Embed nama kode pakan agar frontend tidak perlu lookup tambahan
+    current_feed_code_code: Optional[str] = None
     model_config = {"from_attributes": True}
 
 

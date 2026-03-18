@@ -207,17 +207,22 @@ class MasterFeedCode(PlantBase):
 class MasterLine(PlantBase):
     __tablename__ = "master_lines"
 
-    id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    plant_id:      Mapped[int]       = mapped_column(Integer, nullable=False)
-    name:          Mapped[str]       = mapped_column(String(100), nullable=False)
-    code:          Mapped[str|None]  = mapped_column(String(50))
-    remarks:       Mapped[str|None]  = mapped_column(String(500))
-    is_active:     Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    id:                   Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plant_id:             Mapped[int]       = mapped_column(Integer, nullable=False)
+    name:                 Mapped[str]       = mapped_column(String(100), nullable=False)
+    code:                 Mapped[str|None]  = mapped_column(String(50))
+    remarks:              Mapped[str|None]  = mapped_column(String(500))
+    # Kode pakan aktif saat ini — FK ke master_feed_codes.id, boleh NULL
+    current_feed_code_id: Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
+    is_active:            Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:           Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id:        Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:           Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:        Mapped[int|None]  = mapped_column(Integer, nullable=True)
 
+    current_feed_code:    Mapped["MasterFeedCode|None"] = relationship(
+        "MasterFeedCode", foreign_keys=[current_feed_code_id]
+    )
     standard_throughputs: Mapped[list["MasterStandardThroughput"]] = relationship(
         "MasterStandardThroughput", back_populates="line"
     )

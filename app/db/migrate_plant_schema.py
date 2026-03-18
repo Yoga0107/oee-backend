@@ -1,17 +1,15 @@
 """
 migrate_plant_schema.py
 -----------------------
-Run once after model updates:
+Satu-satunya sumber kebenaran untuk skema tabel plant.
+Aman dijalankan berulang kali (idempotent — semua pakai IF NOT EXISTS).
 
+Usage:
     python -m app.db.migrate_plant_schema
 
-Or called automatically from lifespan in main.py.
-
-Machine Loss architecture:
-  loss_level_1   → L1 master input table
-  loss_level_2   → L2 master input table (FK → loss_level_1)
-  loss_level_3   → L3 master input table (FK → loss_level_2)
-  machine_losses → aggregation table, synced via PostgreSQL trigger
+Atau dipanggil otomatis dari:
+    - main.py lifespan (startup)
+    - plants endpoint saat create plant baru
 """
 
 from sqlalchemy import text
@@ -84,7 +82,7 @@ def migrate_plant_schema(schema_name: str) -> None:
         """))
         conn.commit()
 
-        # Guard: add missing columns to loss_level tables (for older DBs)
+        # Guard: kolom tambahan di loss_level tables
         for tbl in ["loss_level_1", "loss_level_2", "loss_level_3"]:
             for col, coldef in [
                 ("sort_order",    "INTEGER DEFAULT 0"),
@@ -100,37 +98,32 @@ def migrate_plant_schema(schema_name: str) -> None:
 
         print(f"  ✅ loss_level_1/2/3 OK ({s})")
 
-        # ── 4. machine_losses (aggregation table) ────────────────────────────
-        # The existing table may use the OLD self-referencing schema
-        # (parent_id, level, name) WITHOUT level_1_id/level_2_id/level_3_id.
-        # We keep it as-is for backward compatibility.
-        # The trigger below works with WHATEVER columns exist.
+        # ── 4. machine_losses ────────────────────────────────────────────────
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{s}".machine_losses (
-                id         SERIAL PRIMARY KEY,
-                parent_id  INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
-                level      SMALLINT NOT NULL CHECK (level IN (1, 2, 3)),
-                name       VARCHAR(200) NOT NULL,
-                description TEXT,
-                sort_order INTEGER DEFAULT 0,
-                is_active  BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                id            SERIAL PRIMARY KEY,
+                parent_id     INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
+                level         SMALLINT NOT NULL CHECK (level IN (1, 2, 3)),
+                name          VARCHAR(200) NOT NULL,
+                description   TEXT,
+                sort_order    INTEGER DEFAULT 0,
+                is_active     BOOLEAN DEFAULT TRUE,
+                source_id     INTEGER,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by_id INTEGER,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_by_id INTEGER
             )
         """))
         conn.commit()
 
-        # Guard: add missing columns to existing machine_losses
         for col, coldef in [
-            ("description",    "TEXT"),
-            ("is_active",      "BOOLEAN DEFAULT TRUE"),
-            ("updated_at",     "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-            ("updated_by_id",  "INTEGER"),
-            ("created_by_id",  "INTEGER"),
-            # source_id: stores the original loss_level_X.id for reliable lookup
-            ("source_id",      "INTEGER"),
+            ("description",   "TEXT"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+            ("created_by_id", "INTEGER"),
+            ("source_id",     "INTEGER"),
         ]:
             try:
                 conn.execute(text(f'ALTER TABLE "{s}".machine_losses ADD COLUMN IF NOT EXISTS {col} {coldef}'))
@@ -140,9 +133,7 @@ def migrate_plant_schema(schema_name: str) -> None:
 
         print(f"  ✅ machine_losses OK ({s})")
 
-        # ── 5. PostgreSQL trigger: sync loss_level_1/2/3 → machine_losses ────
-        # Uses the ORIGINAL machine_losses schema (parent_id + level + name).
-        # Also stores source_id = the loss_level_X.id for reliable backend lookups.
+        # ── 5. Trigger: sync loss_level_1/2/3 → machine_losses ───────────────
         conn.execute(text(f"""
             CREATE OR REPLACE FUNCTION "{s}".sync_machine_losses()
             RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -163,7 +154,7 @@ def migrate_plant_schema(schema_name: str) -> None:
                                is_active  = NEW.is_active
                          WHERE level = 1 AND source_id = NEW.id;
                         RETURN NEW;
-                    ELSE -- INSERT
+                    ELSE
                         INSERT INTO "{s}".machine_losses
                             (parent_id, level, name, sort_order, is_active, created_by_id, source_id)
                         VALUES (NULL, 1, NEW.name, NEW.sort_order, NEW.is_active, NEW.created_by_id, NEW.id)
@@ -185,13 +176,12 @@ def migrate_plant_schema(schema_name: str) -> None:
                                is_active  = NEW.is_active
                          WHERE level = 2 AND source_id = NEW.id;
                         RETURN NEW;
-                    ELSE -- INSERT: find L1 parent in machine_losses
+                    ELSE
                         SELECT ml.id INTO v_parent_id
                           FROM "{s}".machine_losses ml
                          WHERE ml.level = 1 AND ml.source_id = NEW.level_1_id
                          LIMIT 1;
 
-                        -- Fallback: match by name if source_id not set yet
                         IF v_parent_id IS NULL THEN
                             SELECT ml.id INTO v_parent_id
                               FROM "{s}".machine_losses ml
@@ -215,13 +205,21 @@ def migrate_plant_schema(schema_name: str) -> None:
                          WHERE level = 3 AND source_id = OLD.id;
                         RETURN OLD;
                     ELSIF TG_OP = 'UPDATE' THEN
-                        UPDATE "{s}".machine_losses
+                        UPDATE "{s}".machine_losses ml
                            SET name       = NEW.name,
                                sort_order = NEW.sort_order,
-                               is_active  = NEW.is_active
-                         WHERE level = 3 AND source_id = NEW.id;
+                               is_active  = NEW.is_active,
+                               parent_id  = CASE
+                                   WHEN NEW.level_2_id <> OLD.level_2_id THEN (
+                                       SELECT id FROM "{s}".machine_losses
+                                        WHERE level = 2 AND source_id = NEW.level_2_id
+                                        LIMIT 1
+                                   )
+                                   ELSE ml.parent_id
+                               END
+                         WHERE ml.level = 3 AND ml.source_id = NEW.id;
                         RETURN NEW;
-                    ELSE -- INSERT: find L2 parent in machine_losses
+                    ELSE
                         SELECT ml.id INTO v_parent_id
                           FROM "{s}".machine_losses ml
                          WHERE ml.level = 2 AND ml.source_id = NEW.level_2_id
@@ -262,21 +260,33 @@ def migrate_plant_schema(schema_name: str) -> None:
         # ── 6. machine_loss_hierarchy ────────────────────────────────────────
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{s}".machine_loss_hierarchy (
-                id         SERIAL PRIMARY KEY,
-                sort_order INTEGER DEFAULT 0,
-                is_active  BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_by_id INTEGER,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_by_id INTEGER
+                id                   SERIAL PRIMARY KEY,
+                source_level         SMALLINT     NOT NULL DEFAULT 1,
+                source_name          VARCHAR(200) NOT NULL DEFAULT '',
+                effective_level      SMALLINT     NOT NULL DEFAULT 1,
+                parent_hierarchy_id  INTEGER
+                                       REFERENCES "{s}".machine_loss_hierarchy(id)
+                                       ON DELETE SET NULL,
+                level_1_id           INTEGER REFERENCES "{s}".loss_level_1(id) ON DELETE CASCADE,
+                level_2_id           INTEGER REFERENCES "{s}".loss_level_2(id) ON DELETE CASCADE,
+                level_3_id           INTEGER REFERENCES "{s}".loss_level_3(id) ON DELETE CASCADE,
+                is_unparented        BOOLEAN DEFAULT FALSE,
+                notes                VARCHAR(500),
+                sort_order           INTEGER DEFAULT 0,
+                is_active            BOOLEAN DEFAULT TRUE,
+                created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id        INTEGER,
+                updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id        INTEGER
             )
         """))
         conn.commit()
 
+        # Guard: kolom tambahan machine_loss_hierarchy
         hierarchy_columns = [
-            ("source_level",        "SMALLINT"),
-            ("source_name",         "VARCHAR(200)"),
-            ("effective_level",     "SMALLINT"),
+            ("source_level",        "SMALLINT NOT NULL DEFAULT 1"),
+            ("source_name",         "VARCHAR(200) NOT NULL DEFAULT ''"),
+            ("effective_level",     "SMALLINT NOT NULL DEFAULT 1"),
             ("is_unparented",       "BOOLEAN DEFAULT FALSE"),
             ("notes",               "VARCHAR(500)"),
             ("parent_hierarchy_id", f'INTEGER REFERENCES "{s}".machine_loss_hierarchy(id) ON DELETE SET NULL'),
@@ -291,32 +301,159 @@ def migrate_plant_schema(schema_name: str) -> None:
             except Exception:
                 conn.rollback()
 
+        print(f"  ✅ machine_loss_hierarchy OK ({s})")
+
+        # ── 7. master_shifts ─────────────────────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_shifts (
+                id            SERIAL PRIMARY KEY,
+                name          VARCHAR(50) NOT NULL,
+                time_from     TIME NOT NULL,
+                time_to       TIME NOT NULL,
+                remarks       VARCHAR(500),
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+
+        for col, coldef in [
+            ("remarks",       "VARCHAR(500)"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+            ("created_by_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_shifts ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        print(f"  ✅ master_shifts OK ({s})")
+
+        # ── 8. master_feed_codes ─────────────────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_feed_codes (
+                id            SERIAL PRIMARY KEY,
+                code          VARCHAR(50) UNIQUE NOT NULL,
+                remarks       VARCHAR(500),
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+
+        for col, coldef in [
+            ("remarks",       "VARCHAR(500)"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+            ("created_by_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_feed_codes ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        print(f"  ✅ master_feed_codes OK ({s})")
+
+        # ── 9. master_lines ──────────────────────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_lines (
+                id            SERIAL PRIMARY KEY,
+                plant_id      INTEGER NOT NULL,
+                name          VARCHAR(100) NOT NULL,
+                code          VARCHAR(50),
+                remarks       VARCHAR(500),
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+
+        for col, coldef in [
+            ("plant_id",             "INTEGER NOT NULL DEFAULT 0"),
+            ("code",                 "VARCHAR(50)"),
+            ("remarks",              "VARCHAR(500)"),
+            ("current_feed_code_id", "INTEGER"),
+            ("is_active",            "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",           "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id",        "INTEGER"),
+            ("created_by_id",        "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_lines ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        # FK constraint untuk current_feed_code_id (jika belum ada)
         try:
             conn.execute(text(f"""
-                UPDATE "{s}".machine_loss_hierarchy
-                   SET source_level = 1, effective_level = 1, source_name = 'unknown'
-                 WHERE source_level IS NULL OR effective_level IS NULL OR source_name IS NULL
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints
+                         WHERE constraint_schema = '{s}'
+                           AND table_name = 'master_lines'
+                           AND constraint_name = 'fk_master_lines_feed_code'
+                    ) THEN
+                        ALTER TABLE "{s}".master_lines
+                            ADD CONSTRAINT fk_master_lines_feed_code
+                            FOREIGN KEY (current_feed_code_id)
+                            REFERENCES "{s}".master_feed_codes(id)
+                            ON DELETE SET NULL;
+                    END IF;
+                END $$;
             """))
             conn.commit()
         except Exception:
             conn.rollback()
 
-        for col in ["source_level", "effective_level", "source_name"]:
+        print(f"  ✅ master_lines OK ({s})")
+
+        # ── 10. master_standard_throughputs ──────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_standard_throughputs (
+                id                   SERIAL PRIMARY KEY,
+                line_id              INTEGER NOT NULL
+                                       REFERENCES "{s}".master_lines(id) ON DELETE RESTRICT,
+                feed_code_id         INTEGER NOT NULL
+                                       REFERENCES "{s}".master_feed_codes(id) ON DELETE RESTRICT,
+                standard_throughput  INTEGER NOT NULL,
+                remarks              VARCHAR(500),
+                created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id        INTEGER,
+                updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id        INTEGER,
+                CONSTRAINT uq_line_feedcode UNIQUE (line_id, feed_code_id)
+            )
+        """))
+        conn.commit()
+
+        for col, coldef in [
+            ("remarks",       "VARCHAR(500)"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+            ("created_by_id", "INTEGER"),
+        ]:
             try:
-                conn.execute(text(f'ALTER TABLE "{s}".machine_loss_hierarchy ALTER COLUMN {col} SET NOT NULL'))
+                conn.execute(text(f'ALTER TABLE "{s}".master_standard_throughputs ADD COLUMN IF NOT EXISTS {col} {coldef}'))
                 conn.commit()
             except Exception:
                 conn.rollback()
 
-        print(f"  ✅ machine_loss_hierarchy OK ({s})")
-
-        # ── 7. Guard: is_active on other master tables ────────────────────────
-        for tbl in ["master_shifts", "master_feed_codes", "master_lines"]:
-            try:
-                conn.execute(text(f'ALTER TABLE "{s}".{tbl} ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE'))
-                conn.commit()
-            except Exception:
-                conn.rollback()
+        print(f"  ✅ master_standard_throughputs OK ({s})")
 
         print(f"  ✅ Schema {s} migration complete")
 

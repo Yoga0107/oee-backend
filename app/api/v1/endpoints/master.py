@@ -29,7 +29,7 @@ from app.schemas.master import (
     MachineLossResponse, MachineLossMoveRequest,
     ShiftCreate, ShiftUpdate, ShiftResponse,
     FeedCodeCreate, FeedCodeUpdate, FeedCodeResponse,
-    LineCreate, LineUpdate, LineResponse,
+    LineCreate, LineUpdate, LineFeedCodeUpdate, LineResponse,
     StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse,
 )
 
@@ -50,10 +50,22 @@ def _get_ml(db: Session, ml_id: int) -> MachineLoss:
 
 
 def _ensure_source_id_column(db: Session, schema_name: str):
-    """Add source_id column to machine_losses if it doesn't exist yet."""
+    """Add source_id column to machine_losses jika belum ada.
+
+    Cek via information_schema dahulu — ALTER TABLE tidak dijalankan
+    sama sekali kalau kolom sudah ada, sehingga tidak ada lock pada tabel.
+    """
     try:
-        db.execute(text(f'ALTER TABLE "{schema_name}".machine_losses ADD COLUMN IF NOT EXISTS source_id INTEGER'))
-        db.commit()
+        result = db.execute(text("""
+            SELECT 1 FROM information_schema.columns
+             WHERE table_schema = :schema
+               AND table_name   = 'machine_losses'
+               AND column_name  = 'source_id'
+        """), {"schema": schema_name}).first()
+        if result is None:
+            # Kolom belum ada — baru jalankan ALTER
+            db.execute(text(f'ALTER TABLE "{schema_name}".machine_losses ADD COLUMN source_id INTEGER'))
+            db.commit()
     except Exception:
         db.rollback()
 
@@ -89,12 +101,17 @@ def _get_source_l3(db: Session, ml: MachineLoss) -> LossLevel3 | None:
 
 
 def _set_source_id(db: Session, ml: MachineLoss, source_id: int):
-    """Persist source_id on the machine_losses row."""
+    """Persist source_id on the machine_losses row.
+
+    Tidak pakai schema prefix eksplisit — koneksi sudah set search_path
+    ke schema plant yang benar via get_plant_db().
+    """
     try:
         db.execute(
-            text(f'UPDATE "{ml.__table__.schema or ""}"."machine_losses" SET source_id = :sid WHERE id = :id'),
+            text("UPDATE machine_losses SET source_id = :sid WHERE id = :id"),
             {"sid": source_id, "id": ml.id}
         )
+        db.flush()
     except Exception:
         pass  # column may not exist yet on very old DBs
 
@@ -126,6 +143,7 @@ def create_level1(payload: LossLevel1Create, current_user: CurrentUser, plant: C
     if ml:
         _set_source_id(db, ml, item.id)
         db.commit()
+    db.refresh(item)  # refresh setelah semua commit agar tidak DetachedInstanceError
     return item
 
 
@@ -214,6 +232,7 @@ def create_level2(payload: LossLevel2Create, current_user: CurrentUser, plant: C
     if ml:
         _set_source_id(db, ml, item.id)
         db.commit()
+    db.refresh(item)  # refresh setelah semua commit agar tidak DetachedInstanceError
     return item
 
 
@@ -300,6 +319,7 @@ def create_level3(payload: LossLevel3Create, current_user: CurrentUser, plant: C
     if ml:
         _set_source_id(db, ml, item.id)
         db.commit()
+    db.refresh(item)  # refresh setelah semua commit agar tidak DetachedInstanceError
     return item
 
 
@@ -358,47 +378,97 @@ def move_machine_loss(
 ):
     """
     L3 reparent: move an L3 node to a different L2 parent.
-    Only operation: UPDATE loss_level_3.level_2_id → trigger updates machine_losses.
-    No insert, no delete, no level change.
+    UPDATE loss_level_3.level_2_id → trigger updates machine_losses.parent_id.
+    Juga update machine_losses langsung sebagai safety net.
+
+    Fix: source_id di-backfill jika belum ada, fallback by source_id lebih diutamakan
+    daripada by-name agar tidak salah ambil node dengan nama duplikat.
     """
     db = _db(plant)
+    # _ensure_source_id_column tidak dipanggil di sini — sudah dihandle
+    # saat startup via migrate_plant_schema. Memanggil ALTER TABLE tiap request
+    # menyebabkan AccessExclusiveLock yang memblokir semua query lain.
     ml = _get_ml(db, ml_id)
 
     if ml.level != 3:
         raise HTTPException(status_code=400, detail="Only Level 3 nodes can be moved")
 
     if payload.new_parent_id is None:
-        raise HTTPException(status_code=400, detail="Level 3 requires a parent")
+        raise HTTPException(status_code=400, detail="Level 3 requires a parent (new_parent_id)")
 
-    # Validate new parent is L2
+    # ── Validate new parent is an active L2 ───────────────────────────────────
     new_parent_ml = db.query(MachineLoss).filter(
         MachineLoss.id == payload.new_parent_id,
         MachineLoss.is_active == True,
     ).first()
     if not new_parent_ml:
-        raise HTTPException(status_code=404, detail="New parent node not found")
+        raise HTTPException(status_code=404, detail=f"Parent node id={payload.new_parent_id} not found")
     if new_parent_ml.level != 2:
         raise HTTPException(status_code=400, detail="L3 can only be moved under an L2 parent")
 
-    # Get the real loss_level_2.id for the new parent
+    # ── Resolve loss_level_2 source record ────────────────────────────────────
     new_parent_l2 = _get_source_l2(db, new_parent_ml)
     if not new_parent_l2:
-        raise HTTPException(status_code=404, detail=f"Could not find loss_level_2 record for '{new_parent_ml.name}'")
+        # Last-resort: match by name among active L2 records
+        new_parent_l2 = db.query(LossLevel2).filter(
+            LossLevel2.name == new_parent_ml.name,
+            LossLevel2.is_active == True,
+        ).first()
+    if not new_parent_l2:
+        raise HTTPException(
+            status_code=404,
+            detail=f"loss_level_2 source not found for '{new_parent_ml.name}' (id={new_parent_ml.id}). "
+                   "Run Sync dari Master terlebih dahulu."
+        )
+    # Ensure source_id is persisted on the parent for future calls
+    if not getattr(new_parent_ml, "source_id", None):
+        _set_source_id(db, new_parent_ml, new_parent_l2.id)
 
-    # Get the L3 source record and update its level_2_id
+    # ── Resolve loss_level_3 source record ────────────────────────────────────
     l3_src = _get_source_l3(db, ml)
     if not l3_src:
-        raise HTTPException(status_code=404, detail=f"Could not find loss_level_3 record for '{ml.name}'")
+        # Last-resort: match by name AND current parent to avoid wrong pick on duplicates
+        current_parent_ml = db.query(MachineLoss).filter(
+            MachineLoss.id == ml.parent_id,
+            MachineLoss.is_active == True,
+        ).first() if ml.parent_id else None
 
-    # UPDATE loss_level_3.level_2_id → trigger will update machine_losses.parent_id automatically
-    l3_src.level_2_id     = new_parent_l2.id
-    l3_src.sort_order     = payload.new_sort_order
-    l3_src.updated_by_id  = current_user.id
+        current_l2_src = _get_source_l2(db, current_parent_ml) if current_parent_ml else None
+
+        if current_l2_src:
+            l3_src = db.query(LossLevel3).filter(
+                LossLevel3.name == ml.name,
+                LossLevel3.level_2_id == current_l2_src.id,
+                LossLevel3.is_active == True,
+            ).first()
+
+        if not l3_src:
+            # Broader fallback — by name only
+            l3_src = db.query(LossLevel3).filter(
+                LossLevel3.name == ml.name,
+                LossLevel3.is_active == True,
+            ).first()
+
+    if not l3_src:
+        raise HTTPException(
+            status_code=404,
+            detail=f"loss_level_3 source not found for '{ml.name}' (id={ml.id}). "
+                   "Run Sync dari Master terlebih dahulu."
+        )
+    # Ensure source_id is persisted on the L3 machine_loss row
+    if not getattr(ml, "source_id", None):
+        _set_source_id(db, ml, l3_src.id)
+
+    # ── Perform the move ──────────────────────────────────────────────────────
+    # 1. Update loss_level_3 → trigger will sync machine_losses.parent_id
+    l3_src.level_2_id    = new_parent_l2.id
+    l3_src.sort_order    = payload.new_sort_order
+    l3_src.updated_by_id = current_user.id
     db.flush()
 
-    # Also update machine_losses directly to make sure parent_id is correct
-    ml.parent_id    = payload.new_parent_id
-    ml.sort_order   = payload.new_sort_order
+    # 2. Update machine_losses directly as safety net (in case trigger is slow / missing)
+    ml.parent_id     = payload.new_parent_id
+    ml.sort_order    = payload.new_sort_order
     ml.updated_by_id = current_user.id
     db.commit()
     db.refresh(ml)
@@ -486,15 +556,46 @@ def delete_feed_code(item_id: int, current_user: CurrentUser, plant: CurrentPlan
 @router.get("/lines", response_model=list[LineResponse])
 def get_lines(current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    return db.query(MasterLine).filter(MasterLine.is_active == True).order_by(MasterLine.id).all()
+    lines = db.query(MasterLine).filter(MasterLine.is_active == True).order_by(MasterLine.id).all()
+    # Attach current_feed_code_code ke setiap line untuk response
+    result = []
+    for line in lines:
+        d = {
+            "id": line.id,
+            "plant_id": line.plant_id,
+            "name": line.name,
+            "code": line.code,
+            "remarks": line.remarks,
+            "current_feed_code_id": line.current_feed_code_id,
+            "current_feed_code_code": line.current_feed_code.code if line.current_feed_code else None,
+            "is_active": line.is_active,
+            "created_at": line.created_at,
+            "created_by_id": line.created_by_id,
+        }
+        result.append(d)
+    return result
 
 
 @router.post("/lines", response_model=LineResponse, status_code=201)
 def create_line(payload: LineCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
+    # Validasi current_feed_code_id jika diisi
+    if payload.current_feed_code_id:
+        fc = db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.current_feed_code_id, MasterFeedCode.is_active == True).first()
+        if not fc:
+            raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
     item = MasterLine(**payload.model_dump(), plant_id=plant.id, created_by_id=current_user.id)
     db.add(item); db.commit(); db.refresh(item)
-    return item
+    # Load relasi
+    if item.current_feed_code_id:
+        db.refresh(item)
+    return {
+        "id": item.id, "plant_id": item.plant_id, "name": item.name,
+        "code": item.code, "remarks": item.remarks,
+        "current_feed_code_id": item.current_feed_code_id,
+        "current_feed_code_code": item.current_feed_code.code if item.current_feed_code else None,
+        "is_active": item.is_active, "created_at": item.created_at, "created_by_id": item.created_by_id,
+    }
 
 
 @router.put("/lines/{item_id}", response_model=LineResponse)
@@ -502,9 +603,41 @@ def update_line(item_id: int, payload: LineUpdate, current_user: CurrentUser, pl
     db = _db(plant)
     item = db.query(MasterLine).filter(MasterLine.id == item_id).first()
     if not item: raise HTTPException(status_code=404, detail="Line not found")
+    # Validasi current_feed_code_id jika diisi
+    if payload.current_feed_code_id is not None:
+        fc = db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.current_feed_code_id, MasterFeedCode.is_active == True).first()
+        if not fc:
+            raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
     for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
     item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
-    return item
+    return {
+        "id": item.id, "plant_id": item.plant_id, "name": item.name,
+        "code": item.code, "remarks": item.remarks,
+        "current_feed_code_id": item.current_feed_code_id,
+        "current_feed_code_code": item.current_feed_code.code if item.current_feed_code else None,
+        "is_active": item.is_active, "created_at": item.created_at, "created_by_id": item.created_by_id,
+    }
+
+@router.patch("/lines/{item_id}/feed-code", response_model=LineResponse)
+def set_line_feed_code(item_id: int, payload: LineFeedCodeUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    """Ganti atau hapus kode pakan aktif pada sebuah line."""
+    db = _db(plant)
+    item = db.query(MasterLine).filter(MasterLine.id == item_id, MasterLine.is_active == True).first()
+    if not item: raise HTTPException(status_code=404, detail="Line tidak ditemukan")
+    if payload.current_feed_code_id is not None:
+        fc = db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.current_feed_code_id, MasterFeedCode.is_active == True).first()
+        if not fc:
+            raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
+    item.current_feed_code_id = payload.current_feed_code_id
+    item.updated_by_id = current_user.id
+    db.commit(); db.refresh(item)
+    return {
+        "id": item.id, "plant_id": item.plant_id, "name": item.name,
+        "code": item.code, "remarks": item.remarks,
+        "current_feed_code_id": item.current_feed_code_id,
+        "current_feed_code_code": item.current_feed_code.code if item.current_feed_code else None,
+        "is_active": item.is_active, "created_at": item.created_at, "created_by_id": item.created_by_id,
+    }
 
 
 @router.delete("/lines/{item_id}", status_code=204)

@@ -31,7 +31,9 @@ def get_schema_engine(schema_name: str):
 
 def get_schema_session(schema_name: str) -> sessionmaker:
     schema_engine = get_schema_engine(schema_name)
-    return sessionmaker(autocommit=False, autoflush=False, bind=schema_engine)
+    # expire_on_commit=False: objek tetap accessible setelah commit()
+    # tanpa perlu session aktif — mencegah DetachedInstanceError
+    return sessionmaker(autocommit=False, autoflush=False, bind=schema_engine, expire_on_commit=False)
 
 
 def get_db() -> Generator[Session, None, None]:
