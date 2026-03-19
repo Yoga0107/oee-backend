@@ -13,7 +13,7 @@ Arsitektur Machine Loss:
 """
 from datetime import datetime, time
 from sqlalchemy import (
-    Integer, String, Boolean, DateTime, Time, ForeignKey,
+    Integer, String, Boolean, DateTime, Time, Float, ForeignKey,
     UniqueConstraint, func, Text, SmallInteger
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
@@ -245,3 +245,68 @@ class MasterStandardThroughput(PlantBase):
 
     line:      Mapped["MasterLine"]     = relationship("MasterLine", back_populates="standard_throughputs")
     feed_code: Mapped["MasterFeedCode"] = relationship("MasterFeedCode", back_populates="standard_throughputs")
+
+
+# ─── Production Output ───────────────────────────────────────────────────────
+class ProductionOutput(PlantBase):
+    """Daily shift production entry per line."""
+    __tablename__ = "production_outputs"
+
+    id:               Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    date:             Mapped[datetime]  = mapped_column(DateTime, nullable=False)
+    line_id:          Mapped[int]       = mapped_column(Integer, ForeignKey("master_lines.id", ondelete="RESTRICT"), nullable=False)
+    shift_id:         Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
+    feed_code_id:     Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
+    production_plan:  Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    actual_output:    Mapped[int]       = mapped_column(Integer, nullable=False)
+    good_product:     Mapped[int]       = mapped_column(Integer, nullable=False)
+    reject_product:   Mapped[int]       = mapped_column(Integer, nullable=False)   # computed: actual - good
+    quality_rate:     Mapped[float]     = mapped_column(Float, nullable=False)     # computed: good / actual * 100
+    remarks:          Mapped[str|None]  = mapped_column(String(500))
+    is_active:        Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:       Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id:    Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:       Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:    Mapped[int|None]  = mapped_column(Integer, nullable=True)
+
+    line:       Mapped["MasterLine"]          = relationship("MasterLine")
+    shift:      Mapped["MasterShift"]         = relationship("MasterShift")
+    feed_code:  Mapped["MasterFeedCode|None"] = relationship("MasterFeedCode")
+
+
+# ─── Machine Loss Input ───────────────────────────────────────────────────────
+class MachineLossInput(PlantBase):
+    """
+    Transactional downtime entry per shift per line.
+    References machine_losses (L1/L2/L3) for loss categorisation.
+    Duration is stored in minutes; time_from/time_to are optional exact timestamps.
+    """
+    __tablename__ = "machine_loss_inputs"
+
+    id:               Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    date:             Mapped[datetime]  = mapped_column(DateTime, nullable=False)
+    line_id:          Mapped[int]       = mapped_column(Integer, ForeignKey("master_lines.id",  ondelete="RESTRICT"), nullable=False)
+    shift_id:         Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
+    feed_code_id:     Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
+    # Loss category — all three levels stored; L3 is the most specific
+    loss_l1_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("machine_losses.id", ondelete="RESTRICT"), nullable=True)
+    loss_l2_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("machine_losses.id", ondelete="RESTRICT"), nullable=True)
+    loss_l3_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("machine_losses.id", ondelete="RESTRICT"), nullable=True)
+    # Time window (optional exact timestamps)
+    time_from:        Mapped[str|None]  = mapped_column(String(8))   # HH:MM:SS
+    time_to:          Mapped[str|None]  = mapped_column(String(8))
+    # Duration in minutes — required; computed from time_from/time_to when provided
+    duration_minutes: Mapped[float]     = mapped_column(Float, nullable=False)
+    remarks:          Mapped[str|None]  = mapped_column(String(500))
+    is_active:        Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:       Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id:    Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:       Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:    Mapped[int|None]  = mapped_column(Integer, nullable=True)
+
+    line:      Mapped["MasterLine"]          = relationship("MasterLine")
+    shift:     Mapped["MasterShift"]         = relationship("MasterShift")
+    feed_code: Mapped["MasterFeedCode|None"] = relationship("MasterFeedCode")
+    loss_l1:   Mapped["MachineLoss|None"]    = relationship("MachineLoss", foreign_keys=[loss_l1_id])
+    loss_l2:   Mapped["MachineLoss|None"]    = relationship("MachineLoss", foreign_keys=[loss_l2_id])
+    loss_l3:   Mapped["MachineLoss|None"]    = relationship("MachineLoss", foreign_keys=[loss_l3_id])

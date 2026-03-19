@@ -455,6 +455,54 @@ def migrate_plant_schema(schema_name: str) -> None:
 
         print(f"  ✅ master_standard_throughputs OK ({s})")
 
+        # ── 12. machine_loss_inputs ──────────────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".machine_loss_inputs (
+                id               SERIAL PRIMARY KEY,
+                date             TIMESTAMP NOT NULL,
+                line_id          INTEGER NOT NULL
+                                   REFERENCES "{s}".master_lines(id)  ON DELETE RESTRICT,
+                shift_id         INTEGER NOT NULL
+                                   REFERENCES "{s}".master_shifts(id) ON DELETE RESTRICT,
+                feed_code_id     INTEGER
+                                   REFERENCES "{s}".master_feed_codes(id) ON DELETE SET NULL,
+                loss_l1_id       INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
+                loss_l2_id       INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
+                loss_l3_id       INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
+                time_from        VARCHAR(8),
+                time_to          VARCHAR(8),
+                duration_minutes FLOAT NOT NULL,
+                remarks          VARCHAR(500),
+                is_active        BOOLEAN DEFAULT TRUE,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id    INTEGER,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id    INTEGER
+            )
+        """))
+        conn.commit()
+
+        for col, coldef in [
+            ("feed_code_id",     "INTEGER"),
+            ("loss_l1_id",       "INTEGER"),
+            ("loss_l2_id",       "INTEGER"),
+            ("loss_l3_id",       "INTEGER"),
+            ("time_from",        "VARCHAR(8)"),
+            ("time_to",          "VARCHAR(8)"),
+            ("remarks",          "VARCHAR(500)"),
+            ("is_active",        "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",       "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id",    "INTEGER"),
+            ("created_by_id",    "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".machine_loss_inputs ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        print(f"  ✅ machine_loss_inputs OK ({s})")
+
         print(f"  ✅ Schema {s} migration complete")
 
 
