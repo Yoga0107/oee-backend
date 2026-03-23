@@ -455,6 +455,58 @@ def migrate_plant_schema(schema_name: str) -> None:
 
         print(f"  ✅ master_standard_throughputs OK ({s})")
 
+        # ── 11. production_outputs ───────────────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".production_outputs (
+                id                   SERIAL PRIMARY KEY,
+                date                 TIMESTAMP NOT NULL,
+                line_id              INTEGER NOT NULL
+                                       REFERENCES "{s}".master_lines(id)  ON DELETE RESTRICT,
+                shift_id             INTEGER NOT NULL
+                                       REFERENCES "{s}".master_shifts(id) ON DELETE RESTRICT,
+                feed_code_id         INTEGER
+                                       REFERENCES "{s}".master_feed_codes(id) ON DELETE SET NULL,
+                production_plan      INTEGER,
+                finished_goods       INTEGER NOT NULL DEFAULT 0,
+                downgraded_product   INTEGER NOT NULL DEFAULT 0,
+                wip                  INTEGER NOT NULL DEFAULT 0,
+                remix                INTEGER NOT NULL DEFAULT 0,
+                reject_product       INTEGER NOT NULL DEFAULT 0,
+                actual_output        INTEGER NOT NULL DEFAULT 0,
+                good_product         INTEGER NOT NULL DEFAULT 0,
+                quality_rate         FLOAT   NOT NULL DEFAULT 0,
+                remarks              VARCHAR(500),
+                is_active            BOOLEAN DEFAULT TRUE,
+                created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id        INTEGER,
+                updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id        INTEGER
+            )
+        """))
+        conn.commit()
+
+        # Guard: kolom baru jika tabel sudah ada dari versi lama
+        for col, coldef in [
+            ("finished_goods",     "INTEGER NOT NULL DEFAULT 0"),
+            ("downgraded_product", "INTEGER NOT NULL DEFAULT 0"),
+            ("wip",                "INTEGER NOT NULL DEFAULT 0"),
+            ("remix",              "INTEGER NOT NULL DEFAULT 0"),
+            ("actual_output",      "INTEGER NOT NULL DEFAULT 0"),
+            ("good_product",       "INTEGER NOT NULL DEFAULT 0"),
+            ("quality_rate",       "FLOAT NOT NULL DEFAULT 0"),
+            ("is_active",          "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id",      "INTEGER"),
+            ("created_by_id",      "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".production_outputs ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        print(f"  ✅ production_outputs OK ({s})")
+
         # ── 12. machine_loss_inputs ──────────────────────────────────────────
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{s}".machine_loss_inputs (

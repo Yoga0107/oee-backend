@@ -182,7 +182,6 @@ class LineBase(BaseModel):
     name: str
     code: Optional[str] = None
     remarks: Optional[str] = None
-    current_feed_code_id: Optional[int] = None
 
 
 class LineCreate(LineBase):
@@ -193,13 +192,7 @@ class LineUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     remarks: Optional[str] = None
-    current_feed_code_id: Optional[int] = None
     is_active: Optional[bool] = None
-
-
-class LineFeedCodeUpdate(BaseModel):
-    """Khusus untuk mengganti kode pakan aktif pada sebuah line."""
-    current_feed_code_id: Optional[int] = None  # None = hapus kode pakan
 
 
 class LineResponse(LineBase):
@@ -208,8 +201,6 @@ class LineResponse(LineBase):
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
-    # Embed nama kode pakan agar frontend tidak perlu lookup tambahan
-    current_feed_code_code: Optional[str] = None
     model_config = {"from_attributes": True}
 
 
@@ -252,4 +243,38 @@ class PlantResponse(BaseModel):
     description: Optional[str]
     is_active: bool
     created_at: datetime
+    model_config = {"from_attributes": True}
+
+# ─── Merged Line ──────────────────────────────────────────────────────────────
+class MergedLineCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+    remarks: Optional[str] = None
+    line_ids: list[int]  # minimal 2 line
+
+
+class MergedLineUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    remarks: Optional[str] = None
+    line_ids: Optional[list[int]] = None  # jika dikirim, replace seluruh detail
+    is_active: Optional[bool] = None
+
+
+class MergedLineMemberResponse(BaseModel):
+    line_id: int
+    line_name: str
+    line_code: Optional[str] = None
+    model_config = {"from_attributes": True}
+
+
+class MergedLineResponse(BaseModel):
+    id: int
+    name: str
+    code: Optional[str] = None
+    remarks: Optional[str] = None
+    is_active: bool
+    created_at: datetime
+    created_by_id: Optional[int] = None
+    members: list[MergedLineMemberResponse] = []
     model_config = {"from_attributes": True}

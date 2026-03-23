@@ -21,6 +21,7 @@ from app.models.plant_schema import (
     LossLevel1, LossLevel2, LossLevel3,
     MachineLoss,
     MasterShift, MasterFeedCode, MasterLine, MasterStandardThroughput,
+    MergedLine, MergedLineDetail,
 )
 from app.schemas.master import (
     LossLevel1Create, LossLevel1Update, LossLevel1Response,
@@ -29,8 +30,9 @@ from app.schemas.master import (
     MachineLossResponse, MachineLossMoveRequest,
     ShiftCreate, ShiftUpdate, ShiftResponse,
     FeedCodeCreate, FeedCodeUpdate, FeedCodeResponse,
-    LineCreate, LineUpdate, LineFeedCodeUpdate, LineResponse,
+    LineCreate, LineUpdate, LineResponse,
     StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse,
+    MergedLineCreate, MergedLineUpdate, MergedLineResponse, MergedLineMemberResponse,
 )
 
 router = APIRouter(prefix="/master", tags=["Master Data"])
@@ -38,6 +40,37 @@ router = APIRouter(prefix="/master", tags=["Master Data"])
 
 def _db(plant: Plant) -> Session:
     return next(get_plant_db(plant.schema_name))
+
+
+def _shifts_overlap(from_a, to_a, from_b, to_b) -> bool:
+    """
+    Cek apakah dua interval shift overlap.
+    Mendukung shift yang melewati tengah malam (misal 22:00–06:00).
+    Interval dianggap overlap jika ada irisan waktu — termasuk kasus lintas tengah malam.
+    """
+    from datetime import time as t, timedelta, datetime
+
+    def to_minutes(ti) -> int:
+        if hasattr(ti, 'hour'):
+            return ti.hour * 60 + ti.minute
+        # string "HH:MM"
+        h, m = str(ti).split(':')[:2]
+        return int(h) * 60 + int(m)
+
+    def normalize(start, end):
+        """Return list of (start_min, end_min) segments within [0, 1440*2)."""
+        s, e = to_minutes(start), to_minutes(end)
+        if e <= s:          # crosses midnight
+            return [(s, 1440), (0, e)]
+        return [(s, e)]
+
+    segs_a = normalize(from_a, to_a)
+    segs_b = normalize(from_b, to_b)
+    for (s1, e1) in segs_a:
+        for (s2, e2) in segs_b:
+            if s1 < e2 and s2 < e1:
+                return True
+    return False
 
 
 def _get_ml(db: Session, ml_id: int) -> MachineLoss:
@@ -129,6 +162,10 @@ def list_level1(current_user: CurrentUser, plant: CurrentPlant):
 @router.post("/loss-level-1", response_model=LossLevel1Response, status_code=201)
 def create_level1(payload: LossLevel1Create, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
+    if db.query(LossLevel1).filter(
+        LossLevel1.name == payload.name.strip(), LossLevel1.is_active == True
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Loss Level 1 dengan nama '{payload.name}' sudah ada")
     count = db.query(LossLevel1).filter(LossLevel1.is_active == True).count()
     item = LossLevel1(
         name=payload.name, description=payload.description,
@@ -158,6 +195,13 @@ def update_level1(item_id: int, payload: LossLevel1Update, current_user: Current
             item = _get_source_l1(db, ml)
     if not item:
         raise HTTPException(status_code=404, detail="Loss Level 1 not found")
+    if payload.name and payload.name.strip() != item.name:
+        if db.query(LossLevel1).filter(
+            LossLevel1.name == payload.name.strip(),
+            LossLevel1.is_active == True,
+            LossLevel1.id != item.id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Loss Level 1 dengan nama '{payload.name}' sudah ada")
     for k, v in payload.model_dump(exclude_none=True).items():
         setattr(item, k, v)
     item.updated_by_id = current_user.id
@@ -217,6 +261,14 @@ def create_level2(payload: LossLevel2Create, current_user: CurrentUser, plant: C
     if real_l1_id is None:
         raise HTTPException(status_code=404, detail="Loss Level 1 parent not found")
 
+    # Guard duplikasi nama dalam parent L1 yang sama
+    if db.query(LossLevel2).filter(
+        LossLevel2.level_1_id == real_l1_id,
+        LossLevel2.name == payload.name.strip(),
+        LossLevel2.is_active == True,
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Loss Level 2 '{payload.name}' sudah ada di parent ini")
+
     count = db.query(LossLevel2).filter(LossLevel2.level_1_id == real_l1_id, LossLevel2.is_active == True).count()
     item = LossLevel2(
         level_1_id=real_l1_id, name=payload.name,
@@ -246,6 +298,14 @@ def update_level2(item_id: int, payload: LossLevel2Update, current_user: Current
             item = _get_source_l2(db, ml)
     if not item:
         raise HTTPException(status_code=404, detail="Loss Level 2 not found")
+    if payload.name and payload.name.strip() != item.name:
+        if db.query(LossLevel2).filter(
+            LossLevel2.level_1_id == item.level_1_id,
+            LossLevel2.name == payload.name.strip(),
+            LossLevel2.is_active == True,
+            LossLevel2.id != item.id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Loss Level 2 '{payload.name}' sudah ada di parent ini")
     for k, v in payload.model_dump(exclude_none=True).items():
         setattr(item, k, v)
     item.updated_by_id = current_user.id
@@ -304,6 +364,14 @@ def create_level3(payload: LossLevel3Create, current_user: CurrentUser, plant: C
     if real_l2_id is None:
         raise HTTPException(status_code=404, detail="Loss Level 2 parent not found")
 
+    # Guard duplikasi nama dalam parent L2 yang sama
+    if db.query(LossLevel3).filter(
+        LossLevel3.level_2_id == real_l2_id,
+        LossLevel3.name == payload.name.strip(),
+        LossLevel3.is_active == True,
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Loss Level 3 '{payload.name}' sudah ada di parent ini")
+
     count = db.query(LossLevel3).filter(LossLevel3.level_2_id == real_l2_id, LossLevel3.is_active == True).count()
     item = LossLevel3(
         level_2_id=real_l2_id, name=payload.name,
@@ -333,6 +401,14 @@ def update_level3(item_id: int, payload: LossLevel3Update, current_user: Current
             item = _get_source_l3(db, ml)
     if not item:
         raise HTTPException(status_code=404, detail="Loss Level 3 not found")
+    if payload.name and payload.name.strip() != item.name:
+        if db.query(LossLevel3).filter(
+            LossLevel3.level_2_id == item.level_2_id,
+            LossLevel3.name == payload.name.strip(),
+            LossLevel3.is_active == True,
+            LossLevel3.id != item.id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Loss Level 3 '{payload.name}' sudah ada di parent ini")
     for k, v in payload.model_dump(exclude_none=True).items():
         setattr(item, k, v)
     item.updated_by_id = current_user.id
@@ -488,6 +564,19 @@ def get_shifts(current_user: CurrentUser, plant: CurrentPlant):
 @router.post("/shifts", response_model=ShiftResponse, status_code=201)
 def create_shift(payload: ShiftCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
+    # Guard duplikasi nama
+    if db.query(MasterShift).filter(
+        MasterShift.name == payload.name.strip(), MasterShift.is_active == True
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Shift '{payload.name}' sudah ada")
+    # Guard overlap waktu — cek semua shift aktif
+    existing = db.query(MasterShift).filter(MasterShift.is_active == True).all()
+    for s in existing:
+        if _shifts_overlap(payload.time_from, payload.time_to, s.time_from, s.time_to):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Waktu shift overlap dengan shift '{s.name}' ({s.time_from}–{s.time_to})",
+            )
     item = MasterShift(**payload.model_dump(), created_by_id=current_user.id)
     db.add(item); db.commit(); db.refresh(item)
     return item
@@ -498,6 +587,27 @@ def update_shift(item_id: int, payload: ShiftUpdate, current_user: CurrentUser, 
     db = _db(plant)
     item = db.query(MasterShift).filter(MasterShift.id == item_id).first()
     if not item: raise HTTPException(status_code=404, detail="Shift not found")
+    # Guard duplikasi nama (exclude self)
+    new_name = payload.name.strip() if payload.name else None
+    if new_name and new_name != item.name:
+        if db.query(MasterShift).filter(
+            MasterShift.name == new_name,
+            MasterShift.is_active == True,
+            MasterShift.id != item_id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Shift '{new_name}' sudah ada")
+    # Guard overlap waktu (exclude self)
+    new_from = payload.time_from or item.time_from
+    new_to   = payload.time_to   or item.time_to
+    existing = db.query(MasterShift).filter(
+        MasterShift.is_active == True, MasterShift.id != item_id
+    ).all()
+    for s in existing:
+        if _shifts_overlap(new_from, new_to, s.time_from, s.time_to):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Waktu shift overlap dengan shift '{s.name}' ({s.time_from}–{s.time_to})",
+            )
     for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
     item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
@@ -536,6 +646,13 @@ def update_feed_code(item_id: int, payload: FeedCodeUpdate, current_user: Curren
     db = _db(plant)
     item = db.query(MasterFeedCode).filter(MasterFeedCode.id == item_id).first()
     if not item: raise HTTPException(status_code=404, detail="Feed code not found")
+    if payload.code and payload.code.strip() != item.code:
+        if db.query(MasterFeedCode).filter(
+            MasterFeedCode.code == payload.code.strip(),
+            MasterFeedCode.is_active == True,
+            MasterFeedCode.id != item_id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Kode pakan '{payload.code}' sudah ada")
     for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
     item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
@@ -556,46 +673,28 @@ def delete_feed_code(item_id: int, current_user: CurrentUser, plant: CurrentPlan
 @router.get("/lines", response_model=list[LineResponse])
 def get_lines(current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    lines = db.query(MasterLine).filter(MasterLine.is_active == True).order_by(MasterLine.id).all()
-    # Attach current_feed_code_code ke setiap line untuk response
-    result = []
-    for line in lines:
-        d = {
-            "id": line.id,
-            "plant_id": line.plant_id,
-            "name": line.name,
-            "code": line.code,
-            "remarks": line.remarks,
-            "current_feed_code_id": line.current_feed_code_id,
-            "current_feed_code_code": line.current_feed_code.code if line.current_feed_code else None,
-            "is_active": line.is_active,
-            "created_at": line.created_at,
-            "created_by_id": line.created_by_id,
-        }
-        result.append(d)
-    return result
+    return db.query(MasterLine).filter(MasterLine.is_active == True).order_by(MasterLine.id).all()
 
 
 @router.post("/lines", response_model=LineResponse, status_code=201)
 def create_line(payload: LineCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    # Validasi current_feed_code_id jika diisi
-    if payload.current_feed_code_id:
-        fc = db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.current_feed_code_id, MasterFeedCode.is_active == True).first()
-        if not fc:
-            raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
+    if db.query(MasterLine).filter(
+        MasterLine.name == payload.name.strip(),
+        MasterLine.plant_id == plant.id,
+        MasterLine.is_active == True,
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Line '{payload.name}' sudah ada di plant ini")
+    if payload.code:
+        if db.query(MasterLine).filter(
+            MasterLine.code == payload.code.strip(),
+            MasterLine.plant_id == plant.id,
+            MasterLine.is_active == True,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Kode line '{payload.code}' sudah digunakan")
     item = MasterLine(**payload.model_dump(), plant_id=plant.id, created_by_id=current_user.id)
     db.add(item); db.commit(); db.refresh(item)
-    # Load relasi
-    if item.current_feed_code_id:
-        db.refresh(item)
-    return {
-        "id": item.id, "plant_id": item.plant_id, "name": item.name,
-        "code": item.code, "remarks": item.remarks,
-        "current_feed_code_id": item.current_feed_code_id,
-        "current_feed_code_code": item.current_feed_code.code if item.current_feed_code else None,
-        "is_active": item.is_active, "created_at": item.created_at, "created_by_id": item.created_by_id,
-    }
+    return item
 
 
 @router.put("/lines/{item_id}", response_model=LineResponse)
@@ -603,41 +702,25 @@ def update_line(item_id: int, payload: LineUpdate, current_user: CurrentUser, pl
     db = _db(plant)
     item = db.query(MasterLine).filter(MasterLine.id == item_id).first()
     if not item: raise HTTPException(status_code=404, detail="Line not found")
-    # Validasi current_feed_code_id jika diisi
-    if payload.current_feed_code_id is not None:
-        fc = db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.current_feed_code_id, MasterFeedCode.is_active == True).first()
-        if not fc:
-            raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
+    if payload.name and payload.name.strip() != item.name:
+        if db.query(MasterLine).filter(
+            MasterLine.name == payload.name.strip(),
+            MasterLine.plant_id == item.plant_id,
+            MasterLine.is_active == True,
+            MasterLine.id != item_id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Line '{payload.name}' sudah ada di plant ini")
+    if payload.code and payload.code.strip() != (item.code or ''):
+        if db.query(MasterLine).filter(
+            MasterLine.code == payload.code.strip(),
+            MasterLine.plant_id == item.plant_id,
+            MasterLine.is_active == True,
+            MasterLine.id != item_id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Kode line '{payload.code}' sudah digunakan")
     for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
     item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
-    return {
-        "id": item.id, "plant_id": item.plant_id, "name": item.name,
-        "code": item.code, "remarks": item.remarks,
-        "current_feed_code_id": item.current_feed_code_id,
-        "current_feed_code_code": item.current_feed_code.code if item.current_feed_code else None,
-        "is_active": item.is_active, "created_at": item.created_at, "created_by_id": item.created_by_id,
-    }
-
-@router.patch("/lines/{item_id}/feed-code", response_model=LineResponse)
-def set_line_feed_code(item_id: int, payload: LineFeedCodeUpdate, current_user: CurrentUser, plant: CurrentPlant):
-    """Ganti atau hapus kode pakan aktif pada sebuah line."""
-    db = _db(plant)
-    item = db.query(MasterLine).filter(MasterLine.id == item_id, MasterLine.is_active == True).first()
-    if not item: raise HTTPException(status_code=404, detail="Line tidak ditemukan")
-    if payload.current_feed_code_id is not None:
-        fc = db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.current_feed_code_id, MasterFeedCode.is_active == True).first()
-        if not fc:
-            raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
-    item.current_feed_code_id = payload.current_feed_code_id
-    item.updated_by_id = current_user.id
-    db.commit(); db.refresh(item)
-    return {
-        "id": item.id, "plant_id": item.plant_id, "name": item.name,
-        "code": item.code, "remarks": item.remarks,
-        "current_feed_code_id": item.current_feed_code_id,
-        "current_feed_code_code": item.current_feed_code.code if item.current_feed_code else None,
-        "is_active": item.is_active, "created_at": item.created_at, "created_by_id": item.created_by_id,
-    }
+    return item
 
 
 @router.delete("/lines/{item_id}", status_code=204)
@@ -687,3 +770,144 @@ def delete_standard_throughput(item_id: int, current_user: CurrentUser, plant: C
     item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id).first()
     if not item: raise HTTPException(status_code=404, detail="Standard throughput not found")
     db.delete(item); db.commit()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Merged Lines
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_merged_response(ml: MergedLine) -> dict:
+    return {
+        "id": ml.id,
+        "name": ml.name,
+        "code": ml.code,
+        "remarks": ml.remarks,
+        "is_active": ml.is_active,
+        "created_at": ml.created_at,
+        "created_by_id": ml.created_by_id,
+        "members": [
+            {
+                "line_id": d.line_id,
+                "line_name": d.line.name,
+                "line_code": d.line.code,
+            }
+            for d in ml.details
+        ],
+    }
+
+
+@router.get("/merged-lines", response_model=list[MergedLineResponse])
+def get_merged_lines(current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    rows = (
+        db.query(MergedLine)
+        .filter(MergedLine.is_active == True)
+        .order_by(MergedLine.id)
+        .all()
+    )
+    return [_build_merged_response(r) for r in rows]
+
+
+@router.get("/merged-lines/{item_id}", response_model=MergedLineResponse)
+def get_merged_line(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    ml = db.query(MergedLine).filter(MergedLine.id == item_id).first()
+    if not ml:
+        raise HTTPException(status_code=404, detail="Merged line tidak ditemukan")
+    return _build_merged_response(ml)
+
+
+@router.post("/merged-lines", response_model=MergedLineResponse, status_code=201)
+def create_merged_line(payload: MergedLineCreate, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    if len(payload.line_ids) < 2:
+        raise HTTPException(status_code=400, detail="Minimal 2 line diperlukan untuk membuat merged line")
+    if len(set(payload.line_ids)) != len(payload.line_ids):
+        raise HTTPException(status_code=400, detail="Terdapat line yang duplikat")
+    # Guard duplikasi nama
+    if db.query(MergedLine).filter(
+        MergedLine.name == payload.name.strip(), MergedLine.is_active == True
+    ).first():
+        raise HTTPException(status_code=400, detail=f"Merged line '{payload.name}' sudah ada")
+    if payload.code:
+        if db.query(MergedLine).filter(
+            MergedLine.code == payload.code.strip(), MergedLine.is_active == True
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Kode merged line '{payload.code}' sudah digunakan")
+    # Validasi semua line_id ada dan aktif
+    for lid in payload.line_ids:
+        ln = db.query(MasterLine).filter(MasterLine.id == lid, MasterLine.is_active == True).first()
+        if not ln:
+            raise HTTPException(status_code=404, detail=f"Line dengan id {lid} tidak ditemukan atau tidak aktif")
+    ml = MergedLine(
+        name=payload.name,
+        code=payload.code,
+        remarks=payload.remarks,
+        created_by_id=current_user.id,
+    )
+    db.add(ml)
+    db.flush()  # dapatkan ml.id
+    for lid in payload.line_ids:
+        db.add(MergedLineDetail(merged_line_id=ml.id, line_id=lid))
+    db.commit()
+    db.refresh(ml)
+    return _build_merged_response(ml)
+
+
+@router.put("/merged-lines/{item_id}", response_model=MergedLineResponse)
+def update_merged_line(item_id: int, payload: MergedLineUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    ml = db.query(MergedLine).filter(MergedLine.id == item_id).first()
+    if not ml:
+        raise HTTPException(status_code=404, detail="Merged line tidak ditemukan")
+    # Guard duplikasi nama (exclude self)
+    if payload.name is not None and payload.name.strip() != ml.name:
+        if db.query(MergedLine).filter(
+            MergedLine.name == payload.name.strip(),
+            MergedLine.is_active == True,
+            MergedLine.id != item_id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Merged line '{payload.name}' sudah ada")
+    # Guard duplikasi kode (exclude self)
+    if payload.code is not None and payload.code.strip() != (ml.code or ''):
+        if db.query(MergedLine).filter(
+            MergedLine.code == payload.code.strip(),
+            MergedLine.is_active == True,
+            MergedLine.id != item_id,
+        ).first():
+            raise HTTPException(status_code=400, detail=f"Kode merged line '{payload.code}' sudah digunakan")
+    if payload.name is not None:
+        ml.name = payload.name
+    if payload.code is not None:
+        ml.code = payload.code
+    if payload.remarks is not None:
+        ml.remarks = payload.remarks
+    if payload.is_active is not None:
+        ml.is_active = payload.is_active
+    if payload.line_ids is not None:
+        if len(payload.line_ids) < 2:
+            raise HTTPException(status_code=400, detail="Minimal 2 line diperlukan")
+        if len(set(payload.line_ids)) != len(payload.line_ids):
+            raise HTTPException(status_code=400, detail="Terdapat line yang duplikat")
+        for lid in payload.line_ids:
+            ln = db.query(MasterLine).filter(MasterLine.id == lid, MasterLine.is_active == True).first()
+            if not ln:
+                raise HTTPException(status_code=404, detail=f"Line dengan id {lid} tidak ditemukan atau tidak aktif")
+        # Replace semua detail
+        db.query(MergedLineDetail).filter(MergedLineDetail.merged_line_id == item_id).delete()
+        for lid in payload.line_ids:
+            db.add(MergedLineDetail(merged_line_id=ml.id, line_id=lid))
+    ml.updated_by_id = current_user.id
+    db.commit()
+    db.refresh(ml)
+    return _build_merged_response(ml)
+
+
+@router.delete("/merged-lines/{item_id}", status_code=204)
+def delete_merged_line(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    ml = db.query(MergedLine).filter(MergedLine.id == item_id).first()
+    if not ml:
+        raise HTTPException(status_code=404, detail="Merged line tidak ditemukan")
+    ml.is_active = False
+    ml.updated_by_id = current_user.id
+    db.commit()

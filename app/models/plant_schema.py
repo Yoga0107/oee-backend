@@ -207,22 +207,17 @@ class MasterFeedCode(PlantBase):
 class MasterLine(PlantBase):
     __tablename__ = "master_lines"
 
-    id:                   Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    plant_id:             Mapped[int]       = mapped_column(Integer, nullable=False)
-    name:                 Mapped[str]       = mapped_column(String(100), nullable=False)
-    code:                 Mapped[str|None]  = mapped_column(String(50))
-    remarks:              Mapped[str|None]  = mapped_column(String(500))
-    # Kode pakan aktif saat ini — FK ke master_feed_codes.id, boleh NULL
-    current_feed_code_id: Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
-    is_active:            Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:           Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id:        Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:           Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id:        Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plant_id:      Mapped[int]       = mapped_column(Integer, nullable=False)
+    name:          Mapped[str]       = mapped_column(String(100), nullable=False)
+    code:          Mapped[str|None]  = mapped_column(String(50))
+    remarks:       Mapped[str|None]  = mapped_column(String(500))
+    is_active:     Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
 
-    current_feed_code:    Mapped["MasterFeedCode|None"] = relationship(
-        "MasterFeedCode", foreign_keys=[current_feed_code_id]
-    )
     standard_throughputs: Mapped[list["MasterStandardThroughput"]] = relationship(
         "MasterStandardThroughput", back_populates="line"
     )
@@ -252,22 +247,28 @@ class ProductionOutput(PlantBase):
     """Daily shift production entry per line."""
     __tablename__ = "production_outputs"
 
-    id:               Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    date:             Mapped[datetime]  = mapped_column(DateTime, nullable=False)
-    line_id:          Mapped[int]       = mapped_column(Integer, ForeignKey("master_lines.id", ondelete="RESTRICT"), nullable=False)
-    shift_id:         Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
-    feed_code_id:     Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
-    production_plan:  Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    actual_output:    Mapped[int]       = mapped_column(Integer, nullable=False)
-    good_product:     Mapped[int]       = mapped_column(Integer, nullable=False)
-    reject_product:   Mapped[int]       = mapped_column(Integer, nullable=False)   # computed: actual - good
-    quality_rate:     Mapped[float]     = mapped_column(Float, nullable=False)     # computed: good / actual * 100
-    remarks:          Mapped[str|None]  = mapped_column(String(500))
-    is_active:        Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:       Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id:    Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:       Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id:    Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    id:                  Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    date:                Mapped[datetime]  = mapped_column(DateTime, nullable=False)
+    line_id:             Mapped[int]       = mapped_column(Integer, ForeignKey("master_lines.id", ondelete="RESTRICT"), nullable=False)
+    shift_id:            Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
+    feed_code_id:        Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
+    production_plan:     Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    # ── 5 output fields ───────────────────────────────────────────────────────
+    finished_goods:      Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # FG (kg)
+    downgraded_product:  Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # DG (kg)
+    wip:                 Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # WIP (kg)
+    remix:               Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # Remix (kg)
+    reject_product:      Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # Reject (kg)
+    # ── computed ──────────────────────────────────────────────────────────────
+    actual_output:       Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # sum of 5 fields
+    good_product:        Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # finished_goods only
+    quality_rate:        Mapped[float]     = mapped_column(Float, nullable=False, default=0.0)   # FG / actual * 100
+    remarks:             Mapped[str|None]  = mapped_column(String(500))
+    is_active:           Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:          Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id:       Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:          Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:       Mapped[int|None]  = mapped_column(Integer, nullable=True)
 
     line:       Mapped["MasterLine"]          = relationship("MasterLine")
     shift:      Mapped["MasterShift"]         = relationship("MasterShift")
@@ -310,3 +311,41 @@ class MachineLossInput(PlantBase):
     loss_l1:   Mapped["MachineLoss|None"]    = relationship("MachineLoss", foreign_keys=[loss_l1_id])
     loss_l2:   Mapped["MachineLoss|None"]    = relationship("MachineLoss", foreign_keys=[loss_l2_id])
     loss_l3:   Mapped["MachineLoss|None"]    = relationship("MachineLoss", foreign_keys=[loss_l3_id])
+
+
+# ─── Merged Line ──────────────────────────────────────────────────────────────
+class MergedLine(PlantBase):
+    """
+    Gabungan dari beberapa master_line yang diperlakukan sebagai satu entitas.
+    Misalnya Line 1 + Line 2 digabung menjadi 'Line Gabungan A'.
+    """
+    __tablename__ = "merged_lines"
+
+    id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name:          Mapped[str]       = mapped_column(String(100), nullable=False)
+    code:          Mapped[str|None]  = mapped_column(String(50))
+    remarks:       Mapped[str|None]  = mapped_column(String(500))
+    is_active:     Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
+
+    details: Mapped[list["MergedLineDetail"]] = relationship(
+        "MergedLineDetail", back_populates="merged_line", cascade="all, delete-orphan"
+    )
+
+
+class MergedLineDetail(PlantBase):
+    """Setiap baris = satu master_line anggota dari merged_line."""
+    __tablename__ = "merged_line_details"
+
+    merged_line_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("merged_lines.id", ondelete="CASCADE"), primary_key=True
+    )
+    line_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("master_lines.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    merged_line: Mapped["MergedLine"] = relationship("MergedLine", back_populates="details")
+    line:        Mapped["MasterLine"] = relationship("MasterLine")

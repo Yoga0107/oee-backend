@@ -3,7 +3,7 @@ input.py
 ────────
 Endpoint untuk input data transaksional OEE:
   - Production Output (produksi harian per shift per line)
-  - (future: Machine Loss Input, Operating Time, dll)
+  - Machine Loss Input
 
 URL prefix: /api/v1/input
 """
@@ -33,33 +33,49 @@ def _db(plant: CurrentPlant) -> Session:
     return next(get_plant_db(plant.schema_name))
 
 
+def _compute_derived(
+    finished_goods: int,
+    downgraded_product: int,
+    wip: int,
+    remix: int,
+    reject_product: int,
+) -> tuple[int, int, float]:
+    """
+    Hitung:
+      actual_output = sum of all 5 fields
+      good_product  = finished_goods (saja)
+      quality_rate  = finished_goods / actual_output * 100
+    """
+    actual_output = finished_goods + downgraded_product + wip + remix + reject_product
+    good_product  = finished_goods
+    quality_rate  = round((good_product / actual_output * 100), 2) if actual_output > 0 else 0.0
+    return actual_output, good_product, quality_rate
+
+
 def _build_output_response(item: ProductionOutput) -> dict:
     return {
-        "id":              item.id,
-        "date":            item.date,
-        "line_id":         item.line_id,
-        "shift_id":        item.shift_id,
-        "feed_code_id":    item.feed_code_id,
-        "production_plan": item.production_plan,
-        "actual_output":   item.actual_output,
-        "good_product":    item.good_product,
-        "reject_product":  item.reject_product,
-        "quality_rate":    item.quality_rate,
-        "remarks":         item.remarks,
-        "is_active":       item.is_active,
-        "created_at":      item.created_at,
-        "created_by_id":   item.created_by_id,
-        "line_name":       item.line.name if item.line else None,
-        "shift_name":      item.shift.name if item.shift else None,
-        "feed_code_code":  item.feed_code.code if item.feed_code else None,
+        "id":                 item.id,
+        "date":               item.date,
+        "line_id":            item.line_id,
+        "shift_id":           item.shift_id,
+        "feed_code_id":       item.feed_code_id,
+        "production_plan":    item.production_plan,
+        "finished_goods":     item.finished_goods,
+        "downgraded_product": item.downgraded_product,
+        "wip":                item.wip,
+        "remix":              item.remix,
+        "reject_product":     item.reject_product,
+        "actual_output":      item.actual_output,
+        "good_product":       item.good_product,
+        "quality_rate":       item.quality_rate,
+        "remarks":            item.remarks,
+        "is_active":          item.is_active,
+        "created_at":         item.created_at,
+        "created_by_id":      item.created_by_id,
+        "line_name":          item.line.name      if item.line      else None,
+        "shift_name":         item.shift.name     if item.shift     else None,
+        "feed_code_code":     item.feed_code.code if item.feed_code else None,
     }
-
-
-def _compute_derived(actual_output: int, good_product: int) -> tuple[int, float]:
-    """Hitung reject_product dan quality_rate dari actual dan good."""
-    reject  = actual_output - good_product
-    quality = round((good_product / actual_output * 100), 2) if actual_output > 0 else 0.0
-    return reject, quality
 
 
 # ════════════════════════════════════════════════════════
@@ -106,6 +122,7 @@ def create_production_output(
     if not shift:
         raise HTTPException(status_code=404, detail="Shift tidak ditemukan")
 
+    # Feed code diambil dari master_feed_codes, bebas dipilih (tidak dari relasi line)
     if payload.feed_code_id:
         fc = db.query(MasterFeedCode).filter(
             MasterFeedCode.id == payload.feed_code_id, MasterFeedCode.is_active == True
@@ -113,7 +130,13 @@ def create_production_output(
         if not fc:
             raise HTTPException(status_code=404, detail="Kode pakan tidak ditemukan")
 
-    reject, quality = _compute_derived(payload.actual_output, payload.good_product)
+    actual_output, good_product, quality_rate = _compute_derived(
+        payload.finished_goods,
+        payload.downgraded_product,
+        payload.wip,
+        payload.remix,
+        payload.reject_product,
+    )
 
     item = ProductionOutput(
         date=payload.date,
@@ -121,10 +144,14 @@ def create_production_output(
         shift_id=payload.shift_id,
         feed_code_id=payload.feed_code_id,
         production_plan=payload.production_plan,
-        actual_output=payload.actual_output,
-        good_product=payload.good_product,
-        reject_product=reject,
-        quality_rate=quality,
+        finished_goods=payload.finished_goods,
+        downgraded_product=payload.downgraded_product,
+        wip=payload.wip,
+        remix=payload.remix,
+        reject_product=payload.reject_product,
+        actual_output=actual_output,
+        good_product=good_product,
+        quality_rate=quality_rate,
         remarks=payload.remarks,
         created_by_id=current_user.id,
     )
@@ -165,10 +192,18 @@ def update_production_output(
     for k, v in data.items():
         setattr(item, k, v)
 
-    reject, quality = _compute_derived(item.actual_output, item.good_product)
-    item.reject_product = reject
-    item.quality_rate   = quality
-    item.updated_by_id  = current_user.id
+    # Recompute derived fields
+    actual_output, good_product, quality_rate = _compute_derived(
+        item.finished_goods,
+        item.downgraded_product,
+        item.wip,
+        item.remix,
+        item.reject_product,
+    )
+    item.actual_output = actual_output
+    item.good_product  = good_product
+    item.quality_rate  = quality_rate
+    item.updated_by_id = current_user.id
 
     db.commit()
     db.refresh(item)
@@ -221,7 +256,6 @@ def _build_loss_response(item: MachineLossInput) -> dict:
 
 
 def _validate_loss_refs(db, payload_dict: dict) -> None:
-    """Validate all FK references that exist in the payload."""
     if payload_dict.get("line_id"):
         if not db.query(MasterLine).filter(MasterLine.id == payload_dict["line_id"], MasterLine.is_active == True).first():
             raise HTTPException(status_code=404, detail="Line not found")
