@@ -3,6 +3,7 @@ Run once to initialise the public schema tables and seed default data.
 Usage:  python -m app.db.init_db
 """
 from app.db.database import engine, Base
+from sqlalchemy import text
 from app.models.public import Role, User, Plant, UserPlant, RefreshToken  # noqa: F401
 from app.core.security import get_password_hash
 from sqlalchemy.orm import Session
@@ -12,6 +13,17 @@ def init_db() -> None:
     # Create all public-schema tables
     Base.metadata.create_all(bind=engine)
     print("✅  Public schema tables created.")
+
+    with Session(engine) as db:
+        # Guard: add must_change_password column if it doesn't exist (migration for existing DBs)
+        try:
+            db.execute(text("""
+                ALTER TABLE public.users
+                    ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN DEFAULT FALSE;
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
 
     with Session(engine) as db:
         # Seed roles if not present

@@ -57,7 +57,9 @@ class UserResponse(BaseModel):
     role: RoleBasic
     is_active: bool
     is_superuser: bool
+    must_change_password: bool = False
     created_at: datetime
+    plant_ids: list[int] = []   # populated by endpoint
 
     model_config = {"from_attributes": True}
 
@@ -81,12 +83,12 @@ class RegisterRequest(BaseModel):
     def username_valid(cls, v: str) -> str:
         v = v.strip()
         if len(v) < 3:
-            raise ValueError("Username minimal 3 karakter")
+            raise ValueError("Username must be at least 3 characters")
         if len(v) > 50:
-            raise ValueError("Username maksimal 50 karakter")
+            raise ValueError("Username must be at most 50 characters")
         import re
         if not re.match(r"^[a-zA-Z0-9_.-]+$", v):
-            raise ValueError("Username hanya boleh huruf, angka, titik, strip, dan underscore")
+            raise ValueError("Username may only contain letters, numbers, dots, dashes, and underscores")
         return v
 
     @field_validator("full_name")
@@ -94,9 +96,9 @@ class RegisterRequest(BaseModel):
     def full_name_not_empty(cls, v: str) -> str:
         v = v.strip()
         if not v:
-            raise ValueError("Nama lengkap tidak boleh kosong")
+            raise ValueError("Full name is required")
         if len(v) < 2:
-            raise ValueError("Nama lengkap minimal 2 karakter")
+            raise ValueError("Full name must be at least 2 characters")
         return v
 
     @field_validator("password")
@@ -104,18 +106,18 @@ class RegisterRequest(BaseModel):
     def password_strength(cls, v: str) -> str:
         import re
         if len(v) < 8:
-            raise ValueError("Password minimal 8 karakter")
+            raise ValueError("Password must be at least 8 characters")
         if not re.search(r"[A-Z]", v):
-            raise ValueError("Password harus mengandung minimal 1 huruf kapital")
+            raise ValueError("Password must contain at least one uppercase letter")
         if not re.search(r"[0-9]", v):
-            raise ValueError("Password harus mengandung minimal 1 angka")
+            raise ValueError("Password must contain at least one number")
         return v
 
     @field_validator("confirm_password")
     @classmethod
     def passwords_match(cls, v: str, info) -> str:
         if "password" in info.data and v != info.data["password"]:
-            raise ValueError("Konfirmasi password tidak cocok")
+            raise ValueError("Passwords do not match")
         return v
 
 
@@ -129,7 +131,6 @@ class UserCreate(BaseModel):
     username: str
     email: EmailStr
     full_name: str                   # wajib saat admin buat user
-    password: str
     role_id: int
     plant_ids: list[int] = []
 
@@ -138,14 +139,7 @@ class UserCreate(BaseModel):
     def full_name_not_empty(cls, v: str) -> str:
         v = v.strip()
         if not v:
-            raise ValueError("Nama lengkap tidak boleh kosong")
-        return v
-
-    @field_validator("password")
-    @classmethod
-    def password_min_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password minimal 8 karakter")
+            raise ValueError("Full name is required")
         return v
 
 
@@ -168,7 +162,7 @@ class UpdateProfileRequest(BaseModel):
         if v is not None:
             v = v.strip()
             if not v:
-                raise ValueError("Nama lengkap tidak boleh kosong")
+                raise ValueError("Full name is required")
         return v
 
 
@@ -182,16 +176,21 @@ class ChangePasswordRequest(BaseModel):
     def password_strength(cls, v: str) -> str:
         import re
         if len(v) < 8:
-            raise ValueError("Password baru minimal 8 karakter")
+            raise ValueError("New password must be at least 8 characters")
         if not re.search(r"[A-Z]", v):
-            raise ValueError("Password harus mengandung minimal 1 huruf kapital")
+            raise ValueError("Password must contain at least one uppercase letter")
         if not re.search(r"[0-9]", v):
-            raise ValueError("Password harus mengandung minimal 1 angka")
+            raise ValueError("Password must contain at least one number")
         return v
 
     @field_validator("confirm_new_password")
     @classmethod
     def passwords_match(cls, v: str, info) -> str:
         if "new_password" in info.data and v != info.data["new_password"]:
-            raise ValueError("Konfirmasi password tidak cocok")
+            raise ValueError("Passwords do not match")
         return v
+
+# ─── Reset Password (by Superuser) ───────────────────────────────────────────
+class ResetPasswordResponse(BaseModel):
+    message: str
+    temp_password: str

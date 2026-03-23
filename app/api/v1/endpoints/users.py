@@ -11,7 +11,9 @@ from app.db.database import get_db
 from app.core.deps import SuperUser, CurrentUser
 from app.core.security import get_password_hash
 from app.models.public import User, UserPlant, Role, Plant
-from app.schemas.auth import UserCreate, UserUpdate, UserResponse
+from app.schemas.auth import UserCreate, UserUpdate, UserResponse, ResetPasswordResponse
+
+TEMP_PASSWORD = "Qweqwe123"
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -23,15 +25,16 @@ def _build_response(user: User, db: Session) -> dict:
         for up in db.query(UserPlant).filter(UserPlant.user_id == user.id).all()
     ]
     return {
-        "id":           user.id,
-        "username":     user.username,
-        "email":        user.email,
-        "full_name":    user.full_name,
-        "role":         {"id": user.role.id, "name": user.role.name},
-        "is_active":    user.is_active,
-        "is_superuser": user.is_superuser,
-        "created_at":   user.created_at,
-        "plant_ids":    plant_ids,
+        "id":                   user.id,
+        "username":             user.username,
+        "email":                user.email,
+        "full_name":            user.full_name,
+        "role":                 {"id": user.role.id, "name": user.role.name},
+        "is_active":            user.is_active,
+        "is_superuser":         user.is_superuser,
+        "must_change_password": user.must_change_password,
+        "created_at":           user.created_at,
+        "plant_ids":            plant_ids,
     }
 
 
@@ -50,7 +53,6 @@ def create_user(payload: UserCreate, admin: SuperUser, db: Session = Depends(get
     if not db.query(Role).filter(Role.id == payload.role_id).first():
         raise HTTPException(status_code=404, detail="Role not found")
 
-    # Validate plant_ids
     for pid in payload.plant_ids:
         if not db.query(Plant).filter(Plant.id == pid, Plant.is_active == True).first():
             raise HTTPException(status_code=404, detail=f"Plant id={pid} not found")
@@ -59,7 +61,9 @@ def create_user(payload: UserCreate, admin: SuperUser, db: Session = Depends(get
         username=payload.username,
         email=payload.email,
         full_name=payload.full_name,
-        hashed_password=get_password_hash(payload.password),
+        # Admin-created users get a temporary password and must change it on first login
+        hashed_password=get_password_hash(TEMP_PASSWORD),
+        must_change_password=True,
         role_id=payload.role_id,
         created_by_id=admin.id,
     )
@@ -114,3 +118,35 @@ def deactivate_user(user_id: int, admin: SuperUser, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="User not found")
     user.is_active = False
     db.commit()
+
+
+@router.post("/{user_id}/reset-password", response_model=ResetPasswordResponse)
+def reset_password(user_id: int, admin: SuperUser, db: Session = Depends(get_db)):
+    """
+    Superuser resets a user's password to the system temporary password.
+    The user will be forced to change it on next login.
+    """
+    if not admin.is_superuser:
+        raise HTTPException(status_code=403, detail="Only superusers can reset passwords")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot reset your own password via this endpoint")
+
+    user.hashed_password    = get_password_hash(TEMP_PASSWORD)
+    user.must_change_password = True
+
+    # Revoke all existing refresh tokens — force re-login
+    from app.models.public import RefreshToken
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == user_id,
+        RefreshToken.is_revoked == False,
+    ).update({"is_revoked": True})
+
+    db.commit()
+    return ResetPasswordResponse(
+        message=f"Password untuk {user.username} berhasil direset.",
+        temp_password=TEMP_PASSWORD,
+    )
