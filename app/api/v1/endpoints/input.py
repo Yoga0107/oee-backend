@@ -26,7 +26,7 @@ from openpyxl.utils import get_column_letter
 from app.db.database import get_plant_db
 from app.core.deps import CurrentUser, CurrentPlant
 from app.models.plant_schema import (
-    ProductionOutput,
+    ProductionOutput, ProductionOutputItem,
     MachineLossInput, MachineLoss,
     MasterLine, MasterShift, MasterFeedCode,
 )
@@ -59,6 +59,31 @@ def _compute_derived(fg, dg, wip, remix, rej):
     good = fg
     qr = round((good / actual * 100), 2) if actual > 0 else 0.0
     return actual, good, qr
+
+
+def _sync_output_items(db, item: ProductionOutput):
+    """
+    Sync the production_output_items child rows to match the 5 quantity fields
+    on the parent ProductionOutput. Called after every create/update.
+    Creates items that don't exist; updates quantities; deletes stale rows.
+    """
+    type_qty = {
+        "finished_goods":     item.finished_goods,
+        "downgraded_product": item.downgraded_product,
+        "wip":                item.wip,
+        "remix":              item.remix,
+        "reject_product":     item.reject_product,
+    }
+    existing = {i.output_type: i for i in item.items}
+    for otype, qty in type_qty.items():
+        if otype in existing:
+            existing[otype].quantity = qty
+        else:
+            db.add(ProductionOutputItem(output_id=item.id, output_type=otype, quantity=qty))
+    # Remove any orphan types (shouldn't happen, but safety)
+    for otype, row in existing.items():
+        if otype not in type_qty:
+            db.delete(row)
 
 
 def _build_output_response(item):
@@ -188,6 +213,8 @@ def create_production_output(payload: ProductionOutputCreate, current_user: Curr
         actual_output=actual, good_product=good, quality_rate=qr,
         remarks=payload.remarks, created_by_id=current_user.id)
     db.add(item); db.commit(); db.refresh(item)
+    _sync_output_items(db, item)
+    db.commit(); db.refresh(item)
     return _build_output_response(item)
 
 
@@ -208,6 +235,8 @@ def update_production_output(item_id: int, payload: ProductionOutputUpdate, curr
     actual, good, qr = _compute_derived(item.finished_goods, item.downgraded_product, item.wip, item.remix, item.reject_product)
     item.actual_output = actual; item.good_product = good; item.quality_rate = qr; item.updated_by_id = current_user.id
     db.commit(); db.refresh(item)
+    _sync_output_items(db, item)
+    db.commit(); db.refresh(item)
     return _build_output_response(item)
 
 
@@ -217,6 +246,53 @@ def delete_production_output(item_id: int, current_user: CurrentUser, plant: Cur
     item = db.query(ProductionOutput).filter(ProductionOutput.id == item_id).first()
     if not item: raise HTTPException(404, "Production output tidak ditemukan")
     item.is_active = False; item.updated_by_id = current_user.id; db.commit()
+
+
+@router.get("/production-outputs/by-type", response_model=list[dict])
+def list_output_by_type(
+    current_user: CurrentUser,
+    plant: CurrentPlant,
+    date_from: str | None = None,
+    date_to:   str | None = None,
+    line_id:   int | None = None,
+    shift_id:  int | None = None,
+    output_type: str | None = None,
+):
+    """
+    Return production output broken down by type (finished_goods, downgraded_product, etc.).
+    Each row is one type entry from production_output_items joined with its parent.
+    """
+    from sqlalchemy import text as sqla_text
+    db = _db(plant)
+    q = (
+        db.query(ProductionOutputItem, ProductionOutput)
+        .join(ProductionOutput, ProductionOutputItem.output_id == ProductionOutput.id)
+        .filter(ProductionOutput.is_active == True)
+    )
+    if date_from: q = q.filter(ProductionOutput.date >= dt.fromisoformat(date_from))
+    if date_to:   q = q.filter(ProductionOutput.date <= dt.fromisoformat(date_to + "T23:59:59"))
+    if line_id:   q = q.filter(ProductionOutput.line_id == line_id)
+    if shift_id:  q = q.filter(ProductionOutput.shift_id == shift_id)
+    if output_type: q = q.filter(ProductionOutputItem.output_type == output_type)
+
+    rows = q.order_by(ProductionOutput.date.desc(), ProductionOutput.id.desc()).all()
+    result = []
+    for item_row, parent in rows:
+        result.append({
+            "item_id":     item_row.id,
+            "output_id":   parent.id,
+            "date":        parent.date,
+            "line_id":     parent.line_id,
+            "line_name":   parent.line.name if parent.line else None,
+            "shift_id":    parent.shift_id,
+            "shift_name":  parent.shift.name if parent.shift else None,
+            "feed_code_id":   parent.feed_code_id,
+            "feed_code_code": parent.feed_code.code if parent.feed_code else None,
+            "output_type": item_row.output_type,
+            "quantity":    item_row.quantity,
+            "remarks":     parent.remarks,
+        })
+    return result
 
 
 # ════════════════════════════════════════════════════════

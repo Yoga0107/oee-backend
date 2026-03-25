@@ -273,6 +273,31 @@ class ProductionOutput(PlantBase):
     line:       Mapped["MasterLine"]          = relationship("MasterLine")
     shift:      Mapped["MasterShift"]         = relationship("MasterShift")
     feed_code:  Mapped["MasterFeedCode|None"] = relationship("MasterFeedCode")
+    items:      Mapped[list["ProductionOutputItem"]] = relationship(
+        "ProductionOutputItem", back_populates="output", cascade="all, delete-orphan"
+    )
+
+
+# ─── Production Output Items (per-type breakdown) ────────────────────────────
+OUTPUT_TYPES = ("finished_goods", "downgraded_product", "wip", "remix", "reject_product")
+
+class ProductionOutputItem(PlantBase):
+    """
+    Per-type breakdown of a production output record.
+    Each ProductionOutput has up to 5 items (one per output_type).
+    This allows filtering / reporting by type without changing the parent schema.
+    """
+    __tablename__ = "production_output_items"
+
+    id:          Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    output_id:   Mapped[int]      = mapped_column(
+        Integer, ForeignKey("production_outputs.id", ondelete="CASCADE"), nullable=False
+    )
+    output_type: Mapped[str]      = mapped_column(String(50), nullable=False)  # finished_goods|downgraded_product|wip|remix|reject_product
+    quantity:    Mapped[int]      = mapped_column(Integer, nullable=False, default=0)
+    created_at:  Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    output: Mapped["ProductionOutput"] = relationship("ProductionOutput", back_populates="items")
 
 
 # ─── Machine Loss Input ───────────────────────────────────────────────────────
