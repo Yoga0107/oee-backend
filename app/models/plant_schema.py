@@ -1,16 +1,3 @@
-"""
-Plant-schema models.
-Each plant gets its own PostgreSQL schema with these tables.
-
-Arsitektur Machine Loss:
-  loss_level_1  → tabel master input L1 (Loss Category)
-  loss_level_2  → tabel master input L2 (Sub Category, FK → loss_level_1)
-  loss_level_3  → tabel master input L3 (Detail Loss, FK → loss_level_2)
-  machine_losses → tabel agregasi tersendiri, disync dari loss_level_1/2/3
-                   (via trigger PostgreSQL atau endpoint /sync manual)
-  machine_loss_hierarchy → tabel transaksional drag-and-drop remap,
-                           FK langsung ke loss_level_1/2/3
-"""
 from datetime import datetime, time
 from sqlalchemy import (
     Integer, String, Boolean, DateTime, Time, Float, ForeignKey,
@@ -23,7 +10,7 @@ class PlantBase(DeclarativeBase):
     pass
 
 
-# ─── Loss Level 1 (Loss Category) ─────────────────────────────────────────
+# ─── Loss Level 1 ─────────────────────────────────────────
 class LossLevel1(PlantBase):
     __tablename__ = "loss_level_1"
 
@@ -43,7 +30,7 @@ class LossLevel1(PlantBase):
     )
 
 
-# ─── Loss Level 2 (Sub Category) ──────────────────────────────────────────
+# ─── Loss Level 2 ──────────────────────────────────────────
 class LossLevel2(PlantBase):
     __tablename__ = "loss_level_2"
 
@@ -65,7 +52,7 @@ class LossLevel2(PlantBase):
     )
 
 
-# ─── Loss Level 3 (Detail Loss) ───────────────────────────────────────────
+# ─── Loss Level 3 ───────────────────────────────────────────
 class LossLevel3(PlantBase):
     __tablename__ = "loss_level_3"
 
@@ -83,22 +70,14 @@ class LossLevel3(PlantBase):
     level2: Mapped["LossLevel2"] = relationship("LossLevel2", back_populates="children")
 
 
-# ─── Machine Losses (agregasi tersendiri, disync dari loss_level_1/2/3) ───
+# ─── Machine Losses ───
 class MachineLoss(PlantBase):
-    """
-    Tabel self-referencing tunggal untuk semua level machine loss.
-    - level 1: parent_id IS NULL
-    - level 2: parent_id → machine_losses.id level 1
-    - level 3: parent_id → machine_losses.id level 2
-
-    Ini adalah tabel yang dipakai langsung oleh master page tree + drag-and-drop.
-    Memindah node = update parent_id + level. ID tidak pernah berubah.
-    """
+    
     __tablename__ = "machine_losses"
 
     id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
     parent_id:     Mapped[int|None]  = mapped_column(Integer, ForeignKey("machine_losses.id", ondelete="RESTRICT"), nullable=True)
-    level:         Mapped[int]       = mapped_column(SmallInteger, nullable=False)   # 1 | 2 | 3
+    level:         Mapped[int]       = mapped_column(SmallInteger, nullable=False) 
     name:          Mapped[str]       = mapped_column(String(200), nullable=False)
     description:   Mapped[str|None]  = mapped_column(Text)
     sort_order:    Mapped[int]       = mapped_column(Integer, default=0)
@@ -243,61 +222,45 @@ class MasterStandardThroughput(PlantBase):
 
 
 # ─── Production Output ───────────────────────────────────────────────────────
+# ─── Production Output type & category mapping ───────────────────────────────
+OUTPUT_TYPE_CATEGORY: dict[str, str] = {
+    "finished_goods":     "FG",
+    "downgraded_product": "DOWNGRADED",
+    "wip":                "WIP",
+    "remix":              "REMIX",
+    "reject_product":     "REJECT",
+}
+OUTPUT_TYPES = tuple(OUTPUT_TYPE_CATEGORY.keys())
+
+
 class ProductionOutput(PlantBase):
-    """Daily shift production entry per line."""
+    """
+    Production output — one row per output_type per submission.
+    1 form submit (with 5 qty fields) creates 5 rows sharing the same group_id.
+    group_id is used to fetch/edit/delete all 5 rows together.
+    """
     __tablename__ = "production_outputs"
 
-    id:                  Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    date:                Mapped[datetime]  = mapped_column(DateTime, nullable=False)
-    line_id:             Mapped[int]       = mapped_column(Integer, ForeignKey("master_lines.id", ondelete="RESTRICT"), nullable=False)
-    shift_id:            Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
-    feed_code_id:        Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
-    production_plan:     Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    # ── 5 output fields ───────────────────────────────────────────────────────
-    finished_goods:      Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # FG (kg)
-    downgraded_product:  Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # DG (kg)
-    wip:                 Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # WIP (kg)
-    remix:               Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # Remix (kg)
-    reject_product:      Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # Reject (kg)
-    # ── computed ──────────────────────────────────────────────────────────────
-    actual_output:       Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # sum of 5 fields
-    good_product:        Mapped[int]       = mapped_column(Integer, nullable=False, default=0)   # finished_goods only
-    quality_rate:        Mapped[float]     = mapped_column(Float, nullable=False, default=0.0)   # FG / actual * 100
-    remarks:             Mapped[str|None]  = mapped_column(String(500))
-    is_active:           Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:          Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id:       Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:          Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id:       Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    id:              Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id:        Mapped[str]       = mapped_column(String(36), nullable=False, index=True)  # UUID — ties 5 rows together
+    date:            Mapped[datetime]  = mapped_column(DateTime, nullable=False)
+    line_id:         Mapped[int]       = mapped_column(Integer, ForeignKey("master_lines.id", ondelete="RESTRICT"), nullable=False)
+    shift_id:        Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
+    feed_code_id:    Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
+    production_plan: Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    output_type:     Mapped[str]       = mapped_column(String(50), nullable=False)   # finished_goods | downgraded_product | wip | remix | reject_product
+    category:        Mapped[str]       = mapped_column(String(50), nullable=False)   # FG | DOWNGRADED | WIP | REMIX | REJECT
+    quantity:        Mapped[int]       = mapped_column(Integer, nullable=False, default=0)
+    remarks:         Mapped[str|None]  = mapped_column(String(500))
+    is_active:       Mapped[bool]      = mapped_column(Boolean, default=True)
+    created_at:      Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
+    created_by_id:   Mapped[int|None]  = mapped_column(Integer, nullable=True)
+    updated_at:      Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:   Mapped[int|None]  = mapped_column(Integer, nullable=True)
 
-    line:       Mapped["MasterLine"]          = relationship("MasterLine")
-    shift:      Mapped["MasterShift"]         = relationship("MasterShift")
-    feed_code:  Mapped["MasterFeedCode|None"] = relationship("MasterFeedCode")
-    items:      Mapped[list["ProductionOutputItem"]] = relationship(
-        "ProductionOutputItem", back_populates="output", cascade="all, delete-orphan"
-    )
-
-
-# ─── Production Output Items (per-type breakdown) ────────────────────────────
-OUTPUT_TYPES = ("finished_goods", "downgraded_product", "wip", "remix", "reject_product")
-
-class ProductionOutputItem(PlantBase):
-    """
-    Per-type breakdown of a production output record.
-    Each ProductionOutput has up to 5 items (one per output_type).
-    This allows filtering / reporting by type without changing the parent schema.
-    """
-    __tablename__ = "production_output_items"
-
-    id:          Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
-    output_id:   Mapped[int]      = mapped_column(
-        Integer, ForeignKey("production_outputs.id", ondelete="CASCADE"), nullable=False
-    )
-    output_type: Mapped[str]      = mapped_column(String(50), nullable=False)  # finished_goods|downgraded_product|wip|remix|reject_product
-    quantity:    Mapped[int]      = mapped_column(Integer, nullable=False, default=0)
-    created_at:  Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-
-    output: Mapped["ProductionOutput"] = relationship("ProductionOutput", back_populates="items")
+    line:      Mapped["MasterLine"]          = relationship("MasterLine")
+    shift:     Mapped["MasterShift"]         = relationship("MasterShift")
+    feed_code: Mapped["MasterFeedCode|None"] = relationship("MasterFeedCode")
 
 
 # ─── Machine Loss Input ───────────────────────────────────────────────────────

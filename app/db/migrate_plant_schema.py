@@ -456,48 +456,58 @@ def migrate_plant_schema(schema_name: str) -> None:
         print(f"  ✅ master_standard_throughputs OK ({s})")
 
         # ── 11. production_outputs ───────────────────────────────────────────
+        # New schema: 1 form submit = 5 rows, each row = 1 output_type.
+        # group_id (UUID) ties the 5 rows together for edit/delete.
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{s}".production_outputs (
-                id                   SERIAL PRIMARY KEY,
-                date                 TIMESTAMP NOT NULL,
-                line_id              INTEGER NOT NULL
-                                       REFERENCES "{s}".master_lines(id)  ON DELETE RESTRICT,
-                shift_id             INTEGER NOT NULL
-                                       REFERENCES "{s}".master_shifts(id) ON DELETE RESTRICT,
-                feed_code_id         INTEGER
-                                       REFERENCES "{s}".master_feed_codes(id) ON DELETE SET NULL,
-                production_plan      INTEGER,
-                finished_goods       INTEGER NOT NULL DEFAULT 0,
-                downgraded_product   INTEGER NOT NULL DEFAULT 0,
-                wip                  INTEGER NOT NULL DEFAULT 0,
-                remix                INTEGER NOT NULL DEFAULT 0,
-                reject_product       INTEGER NOT NULL DEFAULT 0,
-                actual_output        INTEGER NOT NULL DEFAULT 0,
-                good_product         INTEGER NOT NULL DEFAULT 0,
-                quality_rate         FLOAT   NOT NULL DEFAULT 0,
-                remarks              VARCHAR(500),
-                is_active            BOOLEAN DEFAULT TRUE,
-                created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_by_id        INTEGER,
-                updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_by_id        INTEGER
+                id               SERIAL PRIMARY KEY,
+                group_id         VARCHAR(36) NOT NULL,
+                date             TIMESTAMP NOT NULL,
+                line_id          INTEGER NOT NULL
+                                   REFERENCES "{s}".master_lines(id)  ON DELETE RESTRICT,
+                shift_id         INTEGER NOT NULL
+                                   REFERENCES "{s}".master_shifts(id) ON DELETE RESTRICT,
+                feed_code_id     INTEGER
+                                   REFERENCES "{s}".master_feed_codes(id) ON DELETE SET NULL,
+                production_plan  INTEGER,
+                output_type      VARCHAR(50) NOT NULL,
+                category         VARCHAR(50) NOT NULL,
+                quantity         INTEGER NOT NULL DEFAULT 0,
+                remarks          VARCHAR(500),
+                is_active        BOOLEAN DEFAULT TRUE,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id    INTEGER,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id    INTEGER
             )
         """))
         conn.commit()
 
-        # Guard: kolom baru jika tabel sudah ada dari versi lama
+        # Indexes for common queries
+        for idx_name, idx_col in [
+            (f"idx_{s}_po_group_id", "group_id"),
+            (f"idx_{s}_po_date",     "date"),
+            (f"idx_{s}_po_type",     "output_type"),
+            (f"idx_{s}_po_category", "category"),
+        ]:
+            try:
+                conn.execute(text(
+                    f'CREATE INDEX IF NOT EXISTS {idx_name} '                    f'ON "{s}".production_outputs ({idx_col})'
+                ))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+        # Guard: add new columns to existing tables (migration from old schema)
         for col, coldef in [
-            ("finished_goods",     "INTEGER NOT NULL DEFAULT 0"),
-            ("downgraded_product", "INTEGER NOT NULL DEFAULT 0"),
-            ("wip",                "INTEGER NOT NULL DEFAULT 0"),
-            ("remix",              "INTEGER NOT NULL DEFAULT 0"),
-            ("actual_output",      "INTEGER NOT NULL DEFAULT 0"),
-            ("good_product",       "INTEGER NOT NULL DEFAULT 0"),
-            ("quality_rate",       "FLOAT NOT NULL DEFAULT 0"),
-            ("is_active",          "BOOLEAN DEFAULT TRUE"),
-            ("updated_at",         "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-            ("updated_by_id",      "INTEGER"),
-            ("created_by_id",      "INTEGER"),
+            ("group_id",    "VARCHAR(36)"),
+            ("output_type", "VARCHAR(50)"),
+            ("category",    "VARCHAR(50)"),
+            ("quantity",    "INTEGER NOT NULL DEFAULT 0"),
+            ("is_active",   "BOOLEAN DEFAULT TRUE"),
+            ("updated_at",  "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+            ("created_by_id", "INTEGER"),
         ]:
             try:
                 conn.execute(text(f'ALTER TABLE "{s}".production_outputs ADD COLUMN IF NOT EXISTS {col} {coldef}'))

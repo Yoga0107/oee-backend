@@ -1,18 +1,5 @@
-"""
-input.py
-────────
-Endpoint untuk input data transaksional OEE:
-  - Production Output (produksi harian per shift per line)
-  - Machine Loss Input
-
-URL prefix: /api/v1/input
-
-Features:
-  - Export to Excel (roles: administrator, plant_manager, operator)
-  - Import from Excel (roles: administrator, plant_manager only)
-"""
-
 import io
+import uuid
 from datetime import datetime as dt
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
@@ -26,7 +13,7 @@ from openpyxl.utils import get_column_letter
 from app.db.database import get_plant_db
 from app.core.deps import CurrentUser, CurrentPlant
 from app.models.plant_schema import (
-    ProductionOutput, ProductionOutputItem,
+    ProductionOutput, OUTPUT_TYPE_CATEGORY, OUTPUT_TYPES,
     MachineLossInput, MachineLoss,
     MasterLine, MasterShift, MasterFeedCode,
 )
@@ -61,46 +48,55 @@ def _compute_derived(fg, dg, wip, remix, rej):
     return actual, good, qr
 
 
-def _sync_output_items(db, item: ProductionOutput):
+def _build_group_response(rows: list) -> dict:
     """
-    Sync the production_output_items child rows to match the 5 quantity fields
-    on the parent ProductionOutput. Called after every create/update.
-    Creates items that don't exist; updates quantities; deletes stale rows.
+    Flatten a list of ProductionOutput rows sharing the same group_id into
+    a single response dict that mirrors the old single-row API shape.
+    The frontend does not need to change.
     """
-    type_qty = {
-        "finished_goods":     item.finished_goods,
-        "downgraded_product": item.downgraded_product,
-        "wip":                item.wip,
-        "remix":              item.remix,
-        "reject_product":     item.reject_product,
-    }
-    existing = {i.output_type: i for i in item.items}
-    for otype, qty in type_qty.items():
-        if otype in existing:
-            existing[otype].quantity = qty
-        else:
-            db.add(ProductionOutputItem(output_id=item.id, output_type=otype, quantity=qty))
-    # Remove any orphan types (shouldn't happen, but safety)
-    for otype, row in existing.items():
-        if otype not in type_qty:
-            db.delete(row)
-
-
-def _build_output_response(item):
+    if not rows:
+        return {}
+    # Use the first row for shared fields
+    ref = rows[0]
+    qty = {r.output_type: r.quantity for r in rows}
+    fg  = qty.get("finished_goods",     0)
+    dg  = qty.get("downgraded_product", 0)
+    wip = qty.get("wip",                0)
+    rmx = qty.get("remix",              0)
+    rej = qty.get("reject_product",     0)
+    actual, good, qr = _compute_derived(fg, dg, wip, rmx, rej)
     return {
-        "id": item.id, "date": item.date,
-        "line_id": item.line_id, "shift_id": item.shift_id,
-        "feed_code_id": item.feed_code_id, "production_plan": item.production_plan,
-        "finished_goods": item.finished_goods, "downgraded_product": item.downgraded_product,
-        "wip": item.wip, "remix": item.remix, "reject_product": item.reject_product,
-        "actual_output": item.actual_output, "good_product": item.good_product,
-        "quality_rate": item.quality_rate, "remarks": item.remarks,
-        "is_active": item.is_active, "created_at": item.created_at,
-        "created_by_id": item.created_by_id,
-        "line_name": item.line.name if item.line else None,
-        "shift_name": item.shift.name if item.shift else None,
-        "feed_code_code": item.feed_code.code if item.feed_code else None,
+        "id":                 ref.group_id,   # group_id serves as the "record id" for the UI
+        "date":               ref.date,
+        "line_id":            ref.line_id,
+        "shift_id":           ref.shift_id,
+        "feed_code_id":       ref.feed_code_id,
+        "production_plan":    ref.production_plan,
+        "finished_goods":     fg,
+        "downgraded_product": dg,
+        "wip":                wip,
+        "remix":              rmx,
+        "reject_product":     rej,
+        "actual_output":      actual,
+        "good_product":       good,
+        "quality_rate":       qr,
+        "remarks":            ref.remarks,
+        "is_active":          ref.is_active,
+        "created_at":         ref.created_at,
+        "created_by_id":      ref.created_by_id,
+        "line_name":          ref.line.name  if ref.line      else None,
+        "shift_name":         ref.shift.name if ref.shift     else None,
+        "feed_code_code":     ref.feed_code.code if ref.feed_code else None,
     }
+
+
+def _get_group(db, group_id: str) -> list:
+    """Return active rows for a group_id, ordered by output_type."""
+    return (
+        db.query(ProductionOutput)
+        .filter(ProductionOutput.group_id == group_id, ProductionOutput.is_active == True)
+        .all()
+    )
 
 
 def _build_loss_response(item):
@@ -192,7 +188,31 @@ def list_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
     if date_to:   q = q.filter(ProductionOutput.date <= dt.fromisoformat(date_to + "T23:59:59"))
     if line_id:   q = q.filter(ProductionOutput.line_id == line_id)
     if shift_id:  q = q.filter(ProductionOutput.shift_id == shift_id)
-    return [_build_output_response(i) for i in q.order_by(ProductionOutput.date.desc(), ProductionOutput.id.desc()).all()]
+    rows = q.order_by(ProductionOutput.date.desc(), ProductionOutput.group_id).all()
+
+    # Auto-backfill rows with NULL group_id (data lama sebelum migration dijalankan).
+    needs_commit = False
+    for r in rows:
+        if not r.group_id:
+            r.group_id = str(uuid.uuid4())
+            if not r.output_type:
+                r.output_type = "finished_goods"
+                r.category    = "FG"
+                r.quantity     = 0
+            needs_commit = True
+    if needs_commit:
+        db.commit()
+        for r in rows: db.refresh(r)
+
+    # Group rows by group_id preserving date-desc order
+    seen: dict[str, list] = {}
+    order: list[str] = []
+    for r in rows:
+        if r.group_id not in seen:
+            seen[r.group_id] = []
+            order.append(r.group_id)
+        seen[r.group_id].append(r)
+    return [_build_group_response(seen[gid]) for gid in order]
 
 
 @router.post("/production-outputs", response_model=ProductionOutputResponse, status_code=201)
@@ -205,24 +225,40 @@ def create_production_output(payload: ProductionOutputCreate, current_user: Curr
     if payload.feed_code_id:
         if not db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.feed_code_id, MasterFeedCode.is_active == True).first():
             raise HTTPException(404, "Kode pakan tidak ditemukan")
-    actual, good, qr = _compute_derived(payload.finished_goods, payload.downgraded_product, payload.wip, payload.remix, payload.reject_product)
-    item = ProductionOutput(date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
-        feed_code_id=payload.feed_code_id, production_plan=payload.production_plan,
-        finished_goods=payload.finished_goods, downgraded_product=payload.downgraded_product,
-        wip=payload.wip, remix=payload.remix, reject_product=payload.reject_product,
-        actual_output=actual, good_product=good, quality_rate=qr,
-        remarks=payload.remarks, created_by_id=current_user.id)
-    db.add(item); db.commit(); db.refresh(item)
-    _sync_output_items(db, item)
-    db.commit(); db.refresh(item)
-    return _build_output_response(item)
+    # 1 submit = 5 rows, semua sharing group_id yang sama
+    gid = str(uuid.uuid4())
+    qty_map = {
+        "finished_goods":     payload.finished_goods,
+        "downgraded_product": payload.downgraded_product,
+        "wip":                payload.wip,
+        "remix":              payload.remix,
+        "reject_product":     payload.reject_product,
+    }
+    new_rows = []
+    for otype in OUTPUT_TYPES:
+        row = ProductionOutput(
+            group_id=gid,
+            date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
+            feed_code_id=payload.feed_code_id, production_plan=payload.production_plan,
+            output_type=otype,
+            category=OUTPUT_TYPE_CATEGORY[otype],
+            quantity=qty_map[otype],
+            remarks=payload.remarks,
+            created_by_id=current_user.id,
+        )
+        db.add(row)
+        new_rows.append(row)
+    db.commit()
+    for r in new_rows: db.refresh(r)
+    return _build_group_response(new_rows)
 
 
-@router.put("/production-outputs/{item_id}", response_model=ProductionOutputResponse)
-def update_production_output(item_id: int, payload: ProductionOutputUpdate, current_user: CurrentUser, plant: CurrentPlant):
+@router.put("/production-outputs/{group_id}", response_model=ProductionOutputResponse)
+def update_production_output(group_id: str, payload: ProductionOutputUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    """Update semua row dalam satu group (group_id). group_id = id dari response."""
     db = _db(plant)
-    item = db.query(ProductionOutput).filter(ProductionOutput.id == item_id, ProductionOutput.is_active == True).first()
-    if not item: raise HTTPException(404, "Production output tidak ditemukan")
+    rows = _get_group(db, group_id)
+    if not rows: raise HTTPException(404, "Production output tidak ditemukan")
     data = payload.model_dump(exclude_none=True)
     if "line_id" in data and not db.query(MasterLine).filter(MasterLine.id == data["line_id"], MasterLine.is_active == True).first():
         raise HTTPException(404, "Line tidak ditemukan")
@@ -231,68 +267,71 @@ def update_production_output(item_id: int, payload: ProductionOutputUpdate, curr
     if "feed_code_id" in data and data["feed_code_id"]:
         if not db.query(MasterFeedCode).filter(MasterFeedCode.id == data["feed_code_id"], MasterFeedCode.is_active == True).first():
             raise HTTPException(404, "Kode pakan tidak ditemukan")
-    for k, v in data.items(): setattr(item, k, v)
-    actual, good, qr = _compute_derived(item.finished_goods, item.downgraded_product, item.wip, item.remix, item.reject_product)
-    item.actual_output = actual; item.good_product = good; item.quality_rate = qr; item.updated_by_id = current_user.id
-    db.commit(); db.refresh(item)
-    _sync_output_items(db, item)
-    db.commit(); db.refresh(item)
-    return _build_output_response(item)
+    # Shared fields — apply to all rows in the group
+    shared_fields = {"date", "line_id", "shift_id", "feed_code_id", "production_plan", "remarks"}
+    qty_fields    = {"finished_goods", "downgraded_product", "wip", "remix", "reject_product"}
+    for row in rows:
+        for k, v in data.items():
+            if k in shared_fields:
+                setattr(row, k, v)
+        # Update quantity for this row's output_type
+        if row.output_type in data and row.output_type in qty_fields:
+            row.quantity = data[row.output_type]
+        row.updated_by_id = current_user.id
+    db.commit()
+    for r in rows: db.refresh(r)
+    return _build_group_response(rows)
 
 
-@router.delete("/production-outputs/{item_id}", status_code=204)
-def delete_production_output(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+@router.delete("/production-outputs/{group_id}", status_code=204)
+def delete_production_output(group_id: str, current_user: CurrentUser, plant: CurrentPlant):
+    """Soft-delete semua row dalam satu group."""
     db = _db(plant)
-    item = db.query(ProductionOutput).filter(ProductionOutput.id == item_id).first()
-    if not item: raise HTTPException(404, "Production output tidak ditemukan")
-    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
+    rows = db.query(ProductionOutput).filter(ProductionOutput.group_id == group_id).all()
+    if not rows: raise HTTPException(404, "Production output tidak ditemukan")
+    for row in rows:
+        row.is_active = False
+        row.updated_by_id = current_user.id
+    db.commit()
 
 
 @router.get("/production-outputs/by-type", response_model=list[dict])
 def list_output_by_type(
     current_user: CurrentUser,
     plant: CurrentPlant,
-    date_from: str | None = None,
-    date_to:   str | None = None,
-    line_id:   int | None = None,
-    shift_id:  int | None = None,
+    date_from:   str | None = None,
+    date_to:     str | None = None,
+    line_id:     int | None = None,
+    shift_id:    int | None = None,
     output_type: str | None = None,
 ):
     """
-    Return production output broken down by type (finished_goods, downgraded_product, etc.).
-    Each row is one type entry from production_output_items joined with its parent.
+    Return production output rows per type — each row is one output_type entry.
+    Now reads directly from production_outputs (no join to a separate items table).
     """
-    from sqlalchemy import text as sqla_text
     db = _db(plant)
-    q = (
-        db.query(ProductionOutputItem, ProductionOutput)
-        .join(ProductionOutput, ProductionOutputItem.output_id == ProductionOutput.id)
-        .filter(ProductionOutput.is_active == True)
-    )
-    if date_from: q = q.filter(ProductionOutput.date >= dt.fromisoformat(date_from))
-    if date_to:   q = q.filter(ProductionOutput.date <= dt.fromisoformat(date_to + "T23:59:59"))
-    if line_id:   q = q.filter(ProductionOutput.line_id == line_id)
-    if shift_id:  q = q.filter(ProductionOutput.shift_id == shift_id)
-    if output_type: q = q.filter(ProductionOutputItem.output_type == output_type)
-
-    rows = q.order_by(ProductionOutput.date.desc(), ProductionOutput.id.desc()).all()
-    result = []
-    for item_row, parent in rows:
-        result.append({
-            "item_id":     item_row.id,
-            "output_id":   parent.id,
-            "date":        parent.date,
-            "line_id":     parent.line_id,
-            "line_name":   parent.line.name if parent.line else None,
-            "shift_id":    parent.shift_id,
-            "shift_name":  parent.shift.name if parent.shift else None,
-            "feed_code_id":   parent.feed_code_id,
-            "feed_code_code": parent.feed_code.code if parent.feed_code else None,
-            "output_type": item_row.output_type,
-            "quantity":    item_row.quantity,
-            "remarks":     parent.remarks,
-        })
-    return result
+    q = db.query(ProductionOutput).filter(ProductionOutput.is_active == True)
+    if date_from:   q = q.filter(ProductionOutput.date >= dt.fromisoformat(date_from))
+    if date_to:     q = q.filter(ProductionOutput.date <= dt.fromisoformat(date_to + "T23:59:59"))
+    if line_id:     q = q.filter(ProductionOutput.line_id == line_id)
+    if shift_id:    q = q.filter(ProductionOutput.shift_id == shift_id)
+    if output_type: q = q.filter(ProductionOutput.output_type == output_type)
+    rows = q.order_by(ProductionOutput.date.desc(), ProductionOutput.group_id).all()
+    return [{
+        "item_id":        r.id,
+        "group_id":       r.group_id,
+        "date":           r.date,
+        "line_id":        r.line_id,
+        "line_name":      r.line.name  if r.line      else None,
+        "shift_id":       r.shift_id,
+        "shift_name":     r.shift.name if r.shift     else None,
+        "feed_code_id":   r.feed_code_id,
+        "feed_code_code": r.feed_code.code if r.feed_code else None,
+        "output_type":    r.output_type,
+        "category":       r.category,
+        "quantity":       r.quantity,
+        "remarks":        r.remarks,
+    } for r in rows]
 
 
 # ════════════════════════════════════════════════════════
@@ -322,14 +361,26 @@ def export_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
     _title_rows(ws, f"Production Output  |  {plant.name}", NCOLS, "1D4ED8")
 
     # KPI strip (row 3)
-    total_plan   = sum(i.production_plan or 0 for i in items)
-    total_actual = sum(i.actual_output   or 0 for i in items)
-    total_fg     = sum(i.finished_goods  or 0 for i in items)
+    # Build grouped data for KPI and export rows
+    from collections import defaultdict
+    groups: dict[str, list] = defaultdict(list)
+    grp_order: list[str] = []
+    for r in items:
+        if r.group_id not in groups:
+            grp_order.append(r.group_id)
+        groups[r.group_id].append(r)
+
+    def _grp_qty(grp_rows, otype):
+        return next((r.quantity for r in grp_rows if r.output_type == otype), 0)
+
+    total_plan   = sum((groups[g][0].production_plan or 0) for g in grp_order)
+    total_fg     = sum(_grp_qty(groups[g], "finished_goods") for g in grp_order)
+    total_actual = sum(sum(r.quantity for r in groups[g]) for g in grp_order)
     avg_q        = round(total_fg / total_actual * 100, 2) if total_actual else 0
     ws.row_dimensions[3].height = 46
 
     for idx, (lbl, val) in enumerate([
-        ("Total Records", len(items)), ("Plan (kg)", f"{total_plan:,}"),
+        ("Total Records", len(grp_order)), ("Plan (kg)", f"{total_plan:,}"),
         ("Actual (kg)", f"{total_actual:,}"), ("Good Product", f"{total_fg:,}"), ("Avg Quality", f"{avg_q}%")
     ]):
         cs = idx * 3 + 1
@@ -351,15 +402,23 @@ def export_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
         c = ws.cell(row=5, column=ci, value=h); _hdr(c, "3B82F6")
         ws.column_dimensions[get_column_letter(ci)].width = w
 
-    for ri, item in enumerate(items, 1):
+    for ri, gid in enumerate(grp_order, 1):
+        grp_rows = groups[gid]
+        ref = grp_rows[0]
+        fg  = _grp_qty(grp_rows, "finished_goods")
+        dg  = _grp_qty(grp_rows, "downgraded_product")
+        wip = _grp_qty(grp_rows, "wip")
+        rmx = _grp_qty(grp_rows, "remix")
+        rej = _grp_qty(grp_rows, "reject_product")
+        act = fg + dg + wip + rmx + rej
+        qp  = round(fg / act * 100, 2) if act else 0
         r = ri + 5; ws.row_dimensions[r].height = 18
-        qp = round(item.finished_goods / item.actual_output * 100, 2) if item.actual_output else 0
-        row_vals = [ri, item.date.strftime("%d/%m/%Y") if item.date else "",
-            item.line.name if item.line else "", item.shift.name if item.shift else "",
-            item.feed_code.code if item.feed_code else "",
-            item.production_plan or 0, item.finished_goods, item.downgraded_product,
-            item.wip, item.remix, item.reject_product, item.actual_output,
-            item.good_product, qp, item.remarks or ""]
+        row_vals = [ri, ref.date.strftime("%d/%m/%Y") if ref.date else "",
+            ref.line.name if ref.line else "", ref.shift.name if ref.shift else "",
+            ref.feed_code.code if ref.feed_code else "",
+            ref.production_plan or 0, fg, dg,
+            wip, rmx, rej, act,
+            fg, qp, ref.remarks or ""]
         for ci, val in enumerate(row_vals, 1):
             c = ws.cell(row=r, column=ci, value=val)
             _data(c, ri, "#,##0" if 6 <= ci <= 13 else None, center=ci <= 5)
@@ -468,12 +527,25 @@ async def import_production_outputs(current_user: CurrentUser, plant: CurrentPla
         i_plan=si(plan,"production_plan"); i_fg=si(fg,"finished_goods"); i_dg=si(dg,"downgraded_product")
         i_wip=si(wip,"wip"); i_rmx=si(remix,"remix"); i_rej=si(rej,"reject_product")
         if errs: errors.append({"row": rn, "errors": errs}); continue
-        actual, good, qr = _compute_derived(i_fg, i_dg, i_wip, i_rmx, i_rej)
-        db.add(ProductionOutput(date=parsed_date, line_id=lo.id, shift_id=so.id,
-            feed_code_id=fco.id if fco else None, production_plan=i_plan,
-            finished_goods=i_fg, downgraded_product=i_dg, wip=i_wip, remix=i_rmx, reject_product=i_rej,
-            actual_output=actual, good_product=good, quality_rate=qr,
-            remarks=str(remarks).strip() if remarks else None, created_by_id=current_user.id))
+        gid = str(uuid.uuid4())
+        qty_map = {
+            "finished_goods":     i_fg,
+            "downgraded_product": i_dg,
+            "wip":                i_wip,
+            "remix":              i_rmx,
+            "reject_product":     i_rej,
+        }
+        for otype in OUTPUT_TYPES:
+            db.add(ProductionOutput(
+                group_id=gid,
+                date=parsed_date, line_id=lo.id, shift_id=so.id,
+                feed_code_id=fco.id if fco else None, production_plan=i_plan,
+                output_type=otype,
+                category=OUTPUT_TYPE_CATEGORY[otype],
+                quantity=qty_map[otype],
+                remarks=str(remarks).strip() if remarks else None,
+                created_by_id=current_user.id,
+            ))
         created += 1
     if created: db.commit()
     return {"imported": created, "errors": errors, "message": f"{created} baris berhasil diimport, {len(errors)} baris gagal."}

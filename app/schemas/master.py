@@ -3,7 +3,7 @@ from typing import Optional
 from datetime import datetime, time
 
 
-# ─── Machine Loss (self-referencing, dipakai master page tree) ────────────────
+# ─── Machine Loss (Index Transacition) ────────────────
 class MachineLossCreate(BaseModel):
     parent_id: Optional[int] = None
     level: int
