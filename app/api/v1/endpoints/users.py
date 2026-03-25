@@ -10,8 +10,16 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.core.deps import SuperUser, CurrentUser
 from app.core.security import get_password_hash
-from app.models.public import User, UserPlant, Role, Plant
+from app.models.public import User, UserPlant, Role, Plant, UserModulePermission
 from app.schemas.auth import UserCreate, UserUpdate, UserResponse, ResetPasswordResponse
+from pydantic import BaseModel
+from typing import List
+
+VALID_MODULES = {"dashboard", "oee", "users", "plants", "settings"}
+
+
+class ModulePermissionsPayload(BaseModel):
+    modules: List[str]  # list of module names; empty list = use role defaults
 
 TEMP_PASSWORD = "Qweqwe123"
 
@@ -150,3 +158,96 @@ def reset_password(user_id: int, admin: SuperUser, db: Session = Depends(get_db)
         message=f"Password untuk {user.username} berhasil direset.",
         temp_password=TEMP_PASSWORD,
     )
+
+
+# ── Module Permissions ────────────────────────────────────────────────────────
+
+@router.get("/me/modules", response_model=dict)
+def get_my_modules(current_user: CurrentUser, db: Session = Depends(get_db)):
+    """
+    Get module permissions for the currently logged-in user.
+    Accessible by any authenticated user (used on login/session restore).
+    """
+    perms = db.query(UserModulePermission).filter(
+        UserModulePermission.user_id == current_user.id
+    ).all()
+
+    return {
+        "user_id": current_user.id,
+        "modules": [p.module for p in perms],
+        "use_role_default": len(perms) == 0,
+    }
+
+
+@router.get("/{user_id}/modules", response_model=dict)
+def get_user_modules(user_id: int, admin: SuperUser, db: Session = Depends(get_db)):
+    """
+    Get module permissions for a user.
+    Returns {"modules": [...], "use_role_default": bool}
+    If use_role_default is True, the user has no custom overrides.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    perms = db.query(UserModulePermission).filter(
+        UserModulePermission.user_id == user_id
+    ).all()
+
+    return {
+        "user_id": user_id,
+        "modules": [p.module for p in perms],
+        "use_role_default": len(perms) == 0,
+    }
+
+
+@router.put("/{user_id}/modules", response_model=dict)
+def set_user_modules(
+    user_id: int,
+    payload: ModulePermissionsPayload,
+    admin: SuperUser,
+    db: Session = Depends(get_db),
+):
+    """
+    Set module permissions for a user.
+    - Pass a list of module names to grant explicit access.
+    - Pass an empty list to remove all custom overrides (revert to role defaults).
+    Valid modules: dashboard, oee, users, plants, settings
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Validate module names
+    invalid = set(payload.modules) - VALID_MODULES
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Module tidak valid: {', '.join(invalid)}. Harus salah satu dari: {', '.join(VALID_MODULES)}",
+        )
+
+    # Delete existing permissions
+    db.query(UserModulePermission).filter(
+        UserModulePermission.user_id == user_id
+    ).delete()
+
+    # Insert new permissions
+    for module in set(payload.modules):
+        db.add(UserModulePermission(
+            user_id=user_id,
+            module=module,
+            created_by_id=admin.id,
+        ))
+
+    db.commit()
+
+    # Re-query to return current state
+    perms = db.query(UserModulePermission).filter(
+        UserModulePermission.user_id == user_id
+    ).all()
+
+    return {
+        "user_id": user_id,
+        "modules": [p.module for p in perms],
+        "use_role_default": len(perms) == 0,
+    }

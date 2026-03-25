@@ -113,6 +113,32 @@ class UserPlant(Base):
 # ... (RefreshToken tetap sama)
 
 
+class UserModulePermission(Base):
+    """
+    Per-user module access override.
+    If a user has ANY row here, only the listed modules are shown in the sidebar.
+    If a user has NO rows here, fallback to role-based defaults.
+
+    Modules: dashboard, oee, users, plants, settings
+    """
+    __tablename__ = "user_module_permissions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "module", name="uq_user_module"),
+        {"schema": "public"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("public.users.id"), nullable=False)
+    module: Mapped[str] = mapped_column(String(50), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_by_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("public.users.id"), nullable=True
+    )
+
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    creator: Mapped["User | None"] = relationship("User", foreign_keys=[created_by_id])
+
+
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
     __table_args__ = {"schema": "public"}

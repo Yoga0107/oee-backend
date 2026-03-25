@@ -4,7 +4,7 @@ Usage:  python -m app.db.init_db
 """
 from app.db.database import engine, Base
 from sqlalchemy import text
-from app.models.public import Role, User, Plant, UserPlant, RefreshToken  # noqa: F401
+from app.models.public import Role, User, Plant, UserPlant, RefreshToken, UserModulePermission  # noqa: F401
 from app.core.security import get_password_hash
 from sqlalchemy.orm import Session
 
@@ -24,6 +24,25 @@ def init_db() -> None:
             db.commit()
         except Exception:
             db.rollback()
+
+    with Session(engine) as db:
+        # Guard: create user_module_permissions table if it doesn't exist
+        try:
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS public.user_module_permissions (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES public.users(id),
+                    module VARCHAR(50) NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    created_by_id INTEGER REFERENCES public.users(id),
+                    CONSTRAINT uq_user_module UNIQUE (user_id, module)
+                );
+            """))
+            db.commit()
+            print("✅  user_module_permissions table ready.")
+        except Exception as e:
+            db.rollback()
+            print(f"⚠️  user_module_permissions table warning: {e}")
 
     with Session(engine) as db:
         # Seed roles if not present
