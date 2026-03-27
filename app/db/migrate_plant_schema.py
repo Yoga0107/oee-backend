@@ -517,7 +517,222 @@ def migrate_plant_schema(schema_name: str) -> None:
 
         print(f"  ✅ production_outputs OK ({s})")
 
-        # ── 12. machine_loss_inputs ──────────────────────────────────────────
+        # ── 12. master_machine_losses_lvl_1 ─────────────────────────────────
+        # Tabel baru 4-table ERD. CREATE IF NOT EXISTS = aman jika sudah ada.
+        # ADD COLUMN IF NOT EXISTS = aman untuk menambah kolom yang kurang.
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_machine_losses_lvl_1 (
+                id            SERIAL PRIMARY KEY,
+                name          VARCHAR(200) NOT NULL,
+                description   TEXT,
+                sort_order    INTEGER DEFAULT 0,
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+        for col, coldef in [
+            ("description",   "TEXT"),
+            ("sort_order",    "INTEGER DEFAULT 0"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("created_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("created_by_id", "INTEGER"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_machine_losses_lvl_1 ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        print(f"  ✅ master_machine_losses_lvl_1 OK ({s})")
+
+        # ── 13. master_machine_losses_lvl_2 ─────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_machine_losses_lvl_2 (
+                id            SERIAL PRIMARY KEY,
+                lvl1_id       INTEGER NOT NULL DEFAULT 0,
+                name          VARCHAR(200) NOT NULL,
+                description   TEXT,
+                sort_order    INTEGER DEFAULT 0,
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+        for col, coldef in [
+            ("description",   "TEXT"),
+            ("sort_order",    "INTEGER DEFAULT 0"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("created_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("created_by_id", "INTEGER"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_machine_losses_lvl_2 ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        # Tambah kolom lvl1_id jika belum ada (tabel lama mungkin tidak punya)
+        try:
+            conn.execute(text(f"""
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = '{s}'
+                           AND table_name   = 'master_machine_losses_lvl_2'
+                           AND column_name  = 'lvl1_id'
+                    ) THEN
+                        ALTER TABLE "{s}".master_machine_losses_lvl_2
+                            ADD COLUMN lvl1_id INTEGER NOT NULL DEFAULT 0;
+                    END IF;
+                END $$;
+            """))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        # FK lvl1_id jika belum ada
+        try:
+            conn.execute(text(f"""
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints tc
+                        JOIN information_schema.constraint_column_usage ccu
+                          ON tc.constraint_name = ccu.constraint_name
+                         WHERE tc.constraint_type = 'FOREIGN KEY'
+                           AND tc.table_schema    = '{s}'
+                           AND tc.table_name      = 'master_machine_losses_lvl_2'
+                           AND ccu.column_name    = 'lvl1_id'
+                    ) THEN
+                        ALTER TABLE "{s}".master_machine_losses_lvl_2
+                            ADD CONSTRAINT fk_ml_lvl2_lvl1
+                            FOREIGN KEY (lvl1_id)
+                            REFERENCES "{s}".master_machine_losses_lvl_1(id)
+                            ON DELETE RESTRICT;
+                    END IF;
+                END $$;
+            """))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        print(f"  ✅ master_machine_losses_lvl_2 OK ({s})")
+
+        # ── 14. master_machine_losses_lvl_3 ─────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_machine_losses_lvl_3 (
+                id            SERIAL PRIMARY KEY,
+                lvl2_id       INTEGER NOT NULL DEFAULT 0,
+                name          VARCHAR(200) NOT NULL,
+                description   TEXT,
+                sort_order    INTEGER DEFAULT 0,
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+        for col, coldef in [
+            ("description",   "TEXT"),
+            ("sort_order",    "INTEGER DEFAULT 0"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("created_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("created_by_id", "INTEGER"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_machine_losses_lvl_3 ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        # Tambah kolom lvl2_id jika belum ada
+        try:
+            conn.execute(text(f"""
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                         WHERE table_schema = '{s}'
+                           AND table_name   = 'master_machine_losses_lvl_3'
+                           AND column_name  = 'lvl2_id'
+                    ) THEN
+                        ALTER TABLE "{s}".master_machine_losses_lvl_3
+                            ADD COLUMN lvl2_id INTEGER NOT NULL DEFAULT 0;
+                    END IF;
+                END $$;
+            """))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        # FK lvl2_id
+        try:
+            conn.execute(text(f"""
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints tc
+                        JOIN information_schema.constraint_column_usage ccu
+                          ON tc.constraint_name = ccu.constraint_name
+                         WHERE tc.constraint_type = 'FOREIGN KEY'
+                           AND tc.table_schema    = '{s}'
+                           AND tc.table_name      = 'master_machine_losses_lvl_3'
+                           AND ccu.column_name    = 'lvl2_id'
+                    ) THEN
+                        ALTER TABLE "{s}".master_machine_losses_lvl_3
+                            ADD CONSTRAINT fk_ml_lvl3_lvl2
+                            FOREIGN KEY (lvl2_id)
+                            REFERENCES "{s}".master_machine_losses_lvl_2(id)
+                            ON DELETE RESTRICT;
+                    END IF;
+                END $$;
+            """))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        print(f"  ✅ master_machine_losses_lvl_3 OK ({s})")
+
+        # ── 15. master_machine_losses (katalog kombinasi L1+L2+L3) ──────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_machine_losses (
+                id            SERIAL PRIMARY KEY,
+                lvl1_id       INTEGER NOT NULL DEFAULT 0,
+                lvl2_id       INTEGER,
+                lvl3_id       INTEGER,
+                remarks       TEXT,
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by_id INTEGER,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by_id INTEGER
+            )
+        """))
+        conn.commit()
+        for col, coldef in [
+            ("lvl2_id",       "INTEGER"),
+            ("lvl3_id",       "INTEGER"),
+            ("remarks",       "TEXT"),
+            ("is_active",     "BOOLEAN DEFAULT TRUE"),
+            ("created_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("created_by_id", "INTEGER"),
+            ("updated_at",    "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("updated_by_id", "INTEGER"),
+        ]:
+            try:
+                conn.execute(text(f'ALTER TABLE "{s}".master_machine_losses ADD COLUMN IF NOT EXISTS {col} {coldef}'))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        print(f"  ✅ master_machine_losses OK ({s})")
+
+        # ── 16. machine_loss_inputs ──────────────────────────────────────────
+        # FK sekarang ke tabel lvl terpisah, bukan machine_losses lama.
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{s}".machine_loss_inputs (
                 id               SERIAL PRIMARY KEY,
@@ -528,9 +743,9 @@ def migrate_plant_schema(schema_name: str) -> None:
                                    REFERENCES "{s}".master_shifts(id) ON DELETE RESTRICT,
                 feed_code_id     INTEGER
                                    REFERENCES "{s}".master_feed_codes(id) ON DELETE SET NULL,
-                loss_l1_id       INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
-                loss_l2_id       INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
-                loss_l3_id       INTEGER REFERENCES "{s}".machine_losses(id) ON DELETE RESTRICT,
+                loss_l1_id       INTEGER REFERENCES "{s}".master_machine_losses_lvl_1(id) ON DELETE RESTRICT,
+                loss_l2_id       INTEGER REFERENCES "{s}".master_machine_losses_lvl_2(id) ON DELETE RESTRICT,
+                loss_l3_id       INTEGER REFERENCES "{s}".master_machine_losses_lvl_3(id) ON DELETE RESTRICT,
                 time_from        VARCHAR(8),
                 time_to          VARCHAR(8),
                 duration_minutes FLOAT NOT NULL,

@@ -9,17 +9,19 @@ from typing import Optional
 from datetime import datetime
 
 
+# ─── Production Output ────────────────────────────────────────────────────────
+
 class ProductionOutputCreate(BaseModel):
     date:               datetime
     line_id:            int
     shift_id:           int
     feed_code_id:       Optional[int]  = None
     production_plan:    Optional[int]  = None
-    finished_goods:     int            = 0
-    downgraded_product: int            = 0
-    wip:                int            = 0
-    remix:              int            = 0
-    reject_product:     int            = 0
+    finished_goods:     int            = 0   # FG (kg)
+    downgraded_product: int            = 0   # DG (kg)
+    wip:                int            = 0   # WIP (kg)
+    remix:              int            = 0   # Remix (kg)
+    reject_product:     int            = 0   # Reject (kg)
     remarks:            Optional[str]  = None
 
     @model_validator(mode="after")
@@ -45,36 +47,31 @@ class ProductionOutputUpdate(BaseModel):
 
 
 class ProductionOutputResponse(BaseModel):
-    """
-    Flattened group response — represents the 5 rows sharing one group_id
-    as a single object so the frontend UI does not need to change.
-    `id` here is the group_id (string UUID).
-    """
-    id:                 str             # group_id — used for edit/delete
+    id:                 int
     date:               datetime
     line_id:            int
     shift_id:           int
     feed_code_id:       Optional[int]
     production_plan:    Optional[int]
-    finished_goods:     int = 0
-    downgraded_product: int = 0
-    wip:                int = 0
-    remix:              int = 0
-    reject_product:     int = 0
-    # computed aggregates
-    actual_output:      int = 0
-    good_product:       int = 0
-    quality_rate:       float = 0.0
+    finished_goods:     int
+    downgraded_product: int
+    wip:                int
+    remix:              int
+    reject_product:     int
+    # computed
+    actual_output:      int
+    good_product:       int
+    quality_rate:       float
     remarks:            Optional[str]
     is_active:          bool
     created_at:         datetime
     created_by_id:      Optional[int]
-    # Embedded names
+    # Embedded names (denormalized untuk display)
     line_name:          Optional[str] = None
     shift_name:         Optional[str] = None
     feed_code_code:     Optional[str] = None
 
-    model_config = {"from_attributes": False}
+    model_config = {"from_attributes": True}
 
 
 # ─── Machine Loss Input ───────────────────────────────────────────────────────

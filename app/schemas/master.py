@@ -3,64 +3,21 @@ from typing import Optional
 from datetime import datetime, time
 
 
-# ─── Machine Loss (Index Transacition) ────────────────
-class MachineLossCreate(BaseModel):
-    parent_id: Optional[int] = None
-    level: int
+# ─── Master Machine Loss Level 1 ─────────────────────────────────────────────
+class MachineLossLvl1Create(BaseModel):
     name: str
     description: Optional[str] = None
     sort_order: int = 0
 
-    @field_validator("level")
-    @classmethod
-    def level_valid(cls, v: int) -> int:
-        if v not in (1, 2, 3):
-            raise ValueError("level harus 1, 2, atau 3")
-        return v
 
-
-class MachineLossUpdate(BaseModel):
+class MachineLossLvl1Update(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     sort_order: Optional[int] = None
     is_active: Optional[bool] = None
 
 
-class MachineLossResponse(BaseModel):
-    id: int
-    parent_id: Optional[int]
-    level: int
-    name: str
-    description: Optional[str]
-    sort_order: int
-    is_active: bool
-    created_at: datetime
-    created_by_id: Optional[int]
-    model_config = {"from_attributes": True}
-
-
-class MachineLossMoveRequest(BaseModel):
-    """Payload drag & drop — pindah node ke parent baru."""
-    new_parent_id: Optional[int]
-    new_level: int
-    new_sort_order: int
-
-
-# ─── Loss Level 1 ────────────────────────────────────────────────────────────
-class LossLevel1Create(BaseModel):
-    name: str
-    description: Optional[str] = None
-    sort_order: int = 0
-
-
-class LossLevel1Update(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    sort_order: Optional[int] = None
-    is_active: Optional[bool] = None
-
-
-class LossLevel1Response(BaseModel):
+class MachineLossLvl1Response(BaseModel):
     id: int
     name: str
     description: Optional[str]
@@ -71,24 +28,24 @@ class LossLevel1Response(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ─── Loss Level 2 ────────────────────────────────────────────────────────────
-class LossLevel2Create(BaseModel):
-    level_1_id: int
+# ─── Master Machine Loss Level 2 ─────────────────────────────────────────────
+class MachineLossLvl2Create(BaseModel):
+    lvl1_id: int
     name: str
     description: Optional[str] = None
     sort_order: int = 0
 
 
-class LossLevel2Update(BaseModel):
+class MachineLossLvl2Update(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     sort_order: Optional[int] = None
     is_active: Optional[bool] = None
 
 
-class LossLevel2Response(BaseModel):
+class MachineLossLvl2Response(BaseModel):
     id: int
-    level_1_id: int
+    lvl1_id: int
     name: str
     description: Optional[str]
     sort_order: int
@@ -98,30 +55,62 @@ class LossLevel2Response(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ─── Loss Level 3 ────────────────────────────────────────────────────────────
-class LossLevel3Create(BaseModel):
-    level_2_id: int
+# ─── Master Machine Loss Level 3 ─────────────────────────────────────────────
+class MachineLossLvl3Create(BaseModel):
+    lvl2_id: int
     name: str
     description: Optional[str] = None
     sort_order: int = 0
 
 
-class LossLevel3Update(BaseModel):
+class MachineLossLvl3Update(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     sort_order: Optional[int] = None
     is_active: Optional[bool] = None
 
 
-class LossLevel3Response(BaseModel):
+class MachineLossLvl3Response(BaseModel):
     id: int
-    level_2_id: int
+    lvl2_id: int
     name: str
     description: Optional[str]
     sort_order: int
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
+    model_config = {"from_attributes": True}
+
+
+# ─── Master Machine Losses (katalog kombinasi) ────────────────────────────────
+class MasterMachineLossCreate(BaseModel):
+    lvl1_id: int
+    lvl2_id: Optional[int] = None
+    lvl3_id: Optional[int] = None
+    remarks: Optional[str] = None
+
+
+class MasterMachineLossUpdate(BaseModel):
+    lvl1_id: Optional[int] = None
+    lvl2_id: Optional[int] = None
+    lvl3_id: Optional[int] = None
+    remarks: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class MasterMachineLossResponse(BaseModel):
+    id: int
+    lvl1_id: int
+    lvl2_id: Optional[int]
+    lvl3_id: Optional[int]
+    remarks: Optional[str]
+    is_active: bool
+    created_at: datetime
+    created_by_id: Optional[int]
+    # Denormalized display names
+    lvl1_name: Optional[str] = None
+    lvl2_name: Optional[str] = None
+    lvl3_name: Optional[str] = None
     model_config = {"from_attributes": True}
 
 

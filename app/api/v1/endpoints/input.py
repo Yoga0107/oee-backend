@@ -14,7 +14,7 @@ from app.db.database import get_plant_db
 from app.core.deps import CurrentUser, CurrentPlant
 from app.models.plant_schema import (
     ProductionOutput, OUTPUT_TYPE_CATEGORY, OUTPUT_TYPES,
-    MachineLossInput, MachineLoss,
+    MachineLossInput, MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
     MasterLine, MasterShift, MasterFeedCode,
 )
 from app.schemas.input import (
@@ -128,10 +128,15 @@ def _validate_loss_refs(db, d):
     if d.get("feed_code_id"):
         if not db.query(MasterFeedCode).filter(MasterFeedCode.id == d["feed_code_id"], MasterFeedCode.is_active == True).first():
             raise HTTPException(404, "Feed code not found")
-    for field, level in [("loss_l1_id", 1), ("loss_l2_id", 2), ("loss_l3_id", 3)]:
-        if d.get(field):
-            if not db.query(MachineLoss).filter(MachineLoss.id == d[field], MachineLoss.level == level, MachineLoss.is_active == True).first():
-                raise HTTPException(404, f"Loss L{level} not found")
+    if d.get("loss_l1_id"):
+        if not db.query(MachineLossLvl1).filter(MachineLossLvl1.id == d["loss_l1_id"], MachineLossLvl1.is_active == True).first():
+            raise HTTPException(404, "Loss L1 not found")
+    if d.get("loss_l2_id"):
+        if not db.query(MachineLossLvl2).filter(MachineLossLvl2.id == d["loss_l2_id"], MachineLossLvl2.is_active == True).first():
+            raise HTTPException(404, "Loss L2 not found")
+    if d.get("loss_l3_id"):
+        if not db.query(MachineLossLvl3).filter(MachineLossLvl3.id == d["loss_l3_id"], MachineLossLvl3.is_active == True).first():
+            raise HTTPException(404, "Loss L3 not found")
 
 
 # ─── Excel style helpers ──────────────────────────────────────────────────────
@@ -711,7 +716,9 @@ async def import_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPl
     lines  = {l.name.strip().lower(): l for l in db.query(MasterLine).filter(MasterLine.is_active == True).all()}
     shifts = {s.name.strip().lower(): s for s in db.query(MasterShift).filter(MasterShift.is_active == True).all()}
     fcodes = {f.code.strip().lower(): f for f in db.query(MasterFeedCode).filter(MasterFeedCode.is_active == True).all()}
-    losses = {(ml.name.strip().lower(), ml.level): ml for ml in db.query(MachineLoss).filter(MachineLoss.is_active == True).all()}
+    losses_l1 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl1).filter(MachineLossLvl1.is_active == True).all()}
+    losses_l2 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl2).filter(MachineLossLvl2.is_active == True).all()}
+    losses_l3 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl3).filter(MachineLossLvl3.is_active == True).all()}
 
     created, errors = 0, []
     for rn, row in enumerate(ws.iter_rows(min_row=4, values_only=True), start=4):
@@ -728,9 +735,9 @@ async def import_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPl
         if not lo: errs.append(f"line '{line_nm}' tidak ditemukan")
         if not so: errs.append(f"shift '{shift_nm}' tidak ditemukan")
         fco = fcodes.get(str(fc_nm or "").strip().lower()) if fc_nm else None
-        l1o = losses.get((str(l1_nm or "").strip().lower(), 1)) if l1_nm else None
-        l2o = losses.get((str(l2_nm or "").strip().lower(), 2)) if l2_nm else None
-        l3o = losses.get((str(l3_nm or "").strip().lower(), 3)) if l3_nm else None
+        l1o = losses_l1.get(str(l1_nm or "").strip().lower()) if l1_nm else None
+        l2o = losses_l2.get(str(l2_nm or "").strip().lower()) if l2_nm else None
+        l3o = losses_l3.get(str(l3_nm or "").strip().lower()) if l3_nm else None
         if fc_nm and not fco: errs.append(f"kode pakan '{fc_nm}' tidak ditemukan")
         if l1_nm and not l1o: errs.append(f"loss L1 '{l1_nm}' tidak ditemukan")
         if l2_nm and not l2o: errs.append(f"loss L2 '{l2_nm}' tidak ditemukan")
