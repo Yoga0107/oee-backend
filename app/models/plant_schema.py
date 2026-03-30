@@ -72,66 +72,29 @@ class LossLevel3(PlantBase):
 
 # ─── Master Machine Losses Level 1 ──────────────────────────────────────────
 class MachineLossLvl1(PlantBase):
-    """master_machine_losses_lvl_1 — top-level loss category."""
+    """master_machine_losses_lvl_1 — top-level loss category (flat, no FK to other levels)."""
     __tablename__ = "master_machine_losses_lvl_1"
 
-    id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name:          Mapped[str]       = mapped_column(String(200), nullable=False)
-    description:   Mapped[str|None]  = mapped_column(Text)
-    sort_order:    Mapped[int]       = mapped_column(Integer, default=0)
-    is_active:     Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-
-    # children in lvl2
-    lvl2_children: Mapped[list["MachineLossLvl2"]] = relationship(
-        "MachineLossLvl2", back_populates="lvl1",
-        order_by="MachineLossLvl2.sort_order",
-    )
+    machine_losses_lvl_1_id: Mapped[int] = mapped_column("machine_losses_lvl_1_id", Integer, primary_key=True, autoincrement=True)
+    name:                    Mapped[str] = mapped_column(String(200), nullable=False)
 
 
 # ─── Master Machine Losses Level 2 ──────────────────────────────────────────
 class MachineLossLvl2(PlantBase):
-    """master_machine_losses_lvl_2 — sub-category loss."""
+    """master_machine_losses_lvl_2 — sub-category loss (flat, no FK to lvl1)."""
     __tablename__ = "master_machine_losses_lvl_2"
 
-    id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lvl1_id:       Mapped[int]       = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_1.id", ondelete="RESTRICT"), nullable=False)
-    name:          Mapped[str]       = mapped_column(String(200), nullable=False)
-    description:   Mapped[str|None]  = mapped_column(Text)
-    sort_order:    Mapped[int]       = mapped_column(Integer, default=0)
-    is_active:     Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-
-    lvl1:          Mapped["MachineLossLvl1"]         = relationship("MachineLossLvl1", back_populates="lvl2_children")
-    lvl3_children: Mapped[list["MachineLossLvl3"]]   = relationship(
-        "MachineLossLvl3", back_populates="lvl2",
-        order_by="MachineLossLvl3.sort_order",
-    )
+    machine_losses_lvl_2_id: Mapped[int] = mapped_column("machine_losses_lvl_2_id", Integer, primary_key=True, autoincrement=True)
+    name:                    Mapped[str] = mapped_column(String(200), nullable=False)
 
 
 # ─── Master Machine Losses Level 3 ──────────────────────────────────────────
 class MachineLossLvl3(PlantBase):
-    """master_machine_losses_lvl_3 — detail loss."""
+    """master_machine_losses_lvl_3 — detail loss (flat, no FK to lvl2)."""
     __tablename__ = "master_machine_losses_lvl_3"
 
-    id:            Mapped[int]       = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lvl2_id:       Mapped[int]       = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_2.id", ondelete="RESTRICT"), nullable=False)
-    name:          Mapped[str]       = mapped_column(String(200), nullable=False)
-    description:   Mapped[str|None]  = mapped_column(Text)
-    sort_order:    Mapped[int]       = mapped_column(Integer, default=0)
-    is_active:     Mapped[bool]      = mapped_column(Boolean, default=True)
-    created_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now())
-    created_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-    updated_at:    Mapped[datetime]  = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id: Mapped[int|None]  = mapped_column(Integer, nullable=True)
-
-    lvl2: Mapped["MachineLossLvl2"] = relationship("MachineLossLvl2", back_populates="lvl3_children")
+    machine_losses_lvl_3_id: Mapped[int] = mapped_column("machine_losses_lvl_3_id", Integer, primary_key=True, autoincrement=True)
+    name:                    Mapped[str] = mapped_column(String(200), nullable=False)
 
 
 # ─── Master Machine Losses (katalog kombinasi L1+L2+L3) ─────────────────────
@@ -143,20 +106,20 @@ class MasterMachineLoss(PlantBase):
     """
     __tablename__ = "master_machine_losses"
 
-    id:               Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lvl1_id:          Mapped[int]      = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_1.id", ondelete="RESTRICT"), nullable=False)
-    lvl2_id:          Mapped[int|None] = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_2.id", ondelete="RESTRICT"), nullable=True)
-    lvl3_id:          Mapped[int|None] = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_3.id", ondelete="RESTRICT"), nullable=True)
-    remarks:          Mapped[str|None] = mapped_column(Text)
-    is_active:        Mapped[bool]     = mapped_column(Boolean, default=True)
-    created_at:       Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    created_by_id:    Mapped[int|None] = mapped_column(Integer, nullable=True)
-    updated_at:       Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id:    Mapped[int|None] = mapped_column(Integer, nullable=True)
+    machine_losses_id:       Mapped[int]      = mapped_column("machine_losses_id", Integer, primary_key=True, autoincrement=True)
+    machine_losses_lvl_1_id: Mapped[int]      = mapped_column("machine_losses_lvl_1_id", Integer, ForeignKey("master_machine_losses_lvl_1.machine_losses_lvl_1_id", ondelete="RESTRICT"), nullable=False)
+    machine_losses_lvl_2_id: Mapped[int|None] = mapped_column("machine_losses_lvl_2_id", Integer, ForeignKey("master_machine_losses_lvl_2.machine_losses_lvl_2_id", ondelete="RESTRICT"), nullable=True)
+    machine_losses_lvl_3_id: Mapped[int|None] = mapped_column("machine_losses_lvl_3_id", Integer, ForeignKey("master_machine_losses_lvl_3.machine_losses_lvl_3_id", ondelete="RESTRICT"), nullable=True)
+    remarks:                 Mapped[str|None] = mapped_column(Text)
+    is_active:               Mapped[bool]     = mapped_column(Boolean, default=True)
+    created_at:              Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_by_id:           Mapped[int|None] = mapped_column(Integer, nullable=True)
+    updated_at:              Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:           Mapped[int|None] = mapped_column(Integer, nullable=True)
 
-    lvl1: Mapped["MachineLossLvl1"]       = relationship("MachineLossLvl1", foreign_keys=[lvl1_id])
-    lvl2: Mapped["MachineLossLvl2|None"]  = relationship("MachineLossLvl2", foreign_keys=[lvl2_id])
-    lvl3: Mapped["MachineLossLvl3|None"]  = relationship("MachineLossLvl3", foreign_keys=[lvl3_id])
+    lvl1: Mapped["MachineLossLvl1"]       = relationship("MachineLossLvl1", foreign_keys=[machine_losses_lvl_1_id])
+    lvl2: Mapped["MachineLossLvl2|None"]  = relationship("MachineLossLvl2", foreign_keys=[machine_losses_lvl_2_id])
+    lvl3: Mapped["MachineLossLvl3|None"]  = relationship("MachineLossLvl3", foreign_keys=[machine_losses_lvl_3_id])
 
 
 # ─── Shift ──────────────────────────────────────────────────────────────────
@@ -289,9 +252,9 @@ class MachineLossInput(PlantBase):
     shift_id:         Mapped[int]       = mapped_column(Integer, ForeignKey("master_shifts.id", ondelete="RESTRICT"), nullable=False)
     feed_code_id:     Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_feed_codes.id", ondelete="SET NULL"), nullable=True)
     # Loss category — FK ke tabel level terpisah sesuai ERD
-    loss_l1_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_1.id", ondelete="RESTRICT"), nullable=True)
-    loss_l2_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_2.id", ondelete="RESTRICT"), nullable=True)
-    loss_l3_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_3.id", ondelete="RESTRICT"), nullable=True)
+    loss_l1_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_1.machine_losses_lvl_1_id", ondelete="RESTRICT"), nullable=True)
+    loss_l2_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_2.machine_losses_lvl_2_id", ondelete="RESTRICT"), nullable=True)
+    loss_l3_id:       Mapped[int|None]  = mapped_column(Integer, ForeignKey("master_machine_losses_lvl_3.machine_losses_lvl_3_id", ondelete="RESTRICT"), nullable=True)
     # Time window (optional exact timestamps)
     time_from:        Mapped[str|None]  = mapped_column(String(8))   # HH:MM:SS
     time_to:          Mapped[str|None]  = mapped_column(String(8))

@@ -118,6 +118,7 @@ def _build_loss_response(item):
     }
 
 
+
 def _validate_loss_refs(db, d):
     if d.get("line_id"):
         if not db.query(MasterLine).filter(MasterLine.id == d["line_id"], MasterLine.is_active == True).first():
@@ -129,13 +130,13 @@ def _validate_loss_refs(db, d):
         if not db.query(MasterFeedCode).filter(MasterFeedCode.id == d["feed_code_id"], MasterFeedCode.is_active == True).first():
             raise HTTPException(404, "Feed code not found")
     if d.get("loss_l1_id"):
-        if not db.query(MachineLossLvl1).filter(MachineLossLvl1.id == d["loss_l1_id"], MachineLossLvl1.is_active == True).first():
+        if not db.query(MachineLossLvl1).filter(MachineLossLvl1.machine_losses_lvl_1_id == d["loss_l1_id"]).first():
             raise HTTPException(404, "Loss L1 not found")
     if d.get("loss_l2_id"):
-        if not db.query(MachineLossLvl2).filter(MachineLossLvl2.id == d["loss_l2_id"], MachineLossLvl2.is_active == True).first():
+        if not db.query(MachineLossLvl2).filter(MachineLossLvl2.machine_losses_lvl_2_id == d["loss_l2_id"]).first():
             raise HTTPException(404, "Loss L2 not found")
     if d.get("loss_l3_id"):
-        if not db.query(MachineLossLvl3).filter(MachineLossLvl3.id == d["loss_l3_id"], MachineLossLvl3.is_active == True).first():
+        if not db.query(MachineLossLvl3).filter(MachineLossLvl3.machine_losses_lvl_3_id == d["loss_l3_id"]).first():
             raise HTTPException(404, "Loss L3 not found")
 
 
@@ -716,9 +717,9 @@ async def import_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPl
     lines  = {l.name.strip().lower(): l for l in db.query(MasterLine).filter(MasterLine.is_active == True).all()}
     shifts = {s.name.strip().lower(): s for s in db.query(MasterShift).filter(MasterShift.is_active == True).all()}
     fcodes = {f.code.strip().lower(): f for f in db.query(MasterFeedCode).filter(MasterFeedCode.is_active == True).all()}
-    losses_l1 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl1).filter(MachineLossLvl1.is_active == True).all()}
-    losses_l2 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl2).filter(MachineLossLvl2.is_active == True).all()}
-    losses_l3 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl3).filter(MachineLossLvl3.is_active == True).all()}
+    losses_l1 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl1).all()}
+    losses_l2 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl2).all()}
+    losses_l3 = {l.name.strip().lower(): l for l in db.query(MachineLossLvl3).all()}
 
     created, errors = 0, []
     for rn, row in enumerate(ws.iter_rows(min_row=4, values_only=True), start=4):
@@ -750,8 +751,9 @@ async def import_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPl
         if errs: errors.append({"row": rn, "errors": errs}); continue
         db.add(MachineLossInput(date=parsed_date, line_id=lo.id, shift_id=so.id,
             feed_code_id=fco.id if fco else None,
-            loss_l1_id=l1o.id if l1o else None, loss_l2_id=l2o.id if l2o else None,
-            loss_l3_id=l3o.id if l3o else None,
+            loss_l1_id=l1o.machine_losses_lvl_1_id if l1o else None,
+            loss_l2_id=l2o.machine_losses_lvl_2_id if l2o else None,
+            loss_l3_id=l3o.machine_losses_lvl_3_id if l3o else None,
             time_from=str(tf).strip() if tf else None, time_to=str(tt).strip() if tt else None,
             duration_minutes=dur, remarks=str(remarks).strip() if remarks else None,
             created_by_id=current_user.id))
