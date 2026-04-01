@@ -4,7 +4,7 @@ input.py (schemas)
 Pydantic schemas untuk endpoint input data transaksional OEE.
 """
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
 from typing import Optional
 from datetime import datetime
 
@@ -12,64 +12,52 @@ from datetime import datetime
 # ─── Production Output ────────────────────────────────────────────────────────
 
 class ProductionOutputCreate(BaseModel):
-    date:               datetime
-    line_id:            int
-    shift_id:           int
-    feed_code_id:       Optional[int]  = None
-    production_plan:    Optional[int]  = None
-    finished_goods:     int            = 0   # FG (kg)
-    downgraded_product: int            = 0   # DG (kg)
-    wip:                int            = 0   # WIP (kg)
-    remix:              int            = 0   # Remix (kg)
-    reject_product:     int            = 0   # Reject (kg)
-    remarks:            Optional[str]  = None
+    date:            datetime
+    line_id:         int
+    shift_id:        int
+    feed_code_id:    Optional[int]        = None
+    production_plan: Optional[int]        = None
+    quantities:      dict[str, int]       = {}   # {output_type_code: quantity}
+    remarks:         Optional[str]        = None
 
-    @model_validator(mode="after")
-    def all_non_negative(self) -> "ProductionOutputCreate":
-        for field in ("finished_goods", "downgraded_product", "wip", "remix", "reject_product"):
-            if getattr(self, field) < 0:
-                raise ValueError(f"{field} tidak boleh negatif")
-        return self
+    @field_validator("quantities")
+    @classmethod
+    def quantities_non_negative(cls, v: dict) -> dict:
+        for k, qty in v.items():
+            if qty < 0:
+                raise ValueError(f"Quantity untuk '{k}' tidak boleh negatif")
+        return v
 
 
 class ProductionOutputUpdate(BaseModel):
-    date:               Optional[datetime] = None
-    line_id:            Optional[int]      = None
-    shift_id:           Optional[int]      = None
-    feed_code_id:       Optional[int]      = None
-    production_plan:    Optional[int]      = None
-    finished_goods:     Optional[int]      = None
-    downgraded_product: Optional[int]      = None
-    wip:                Optional[int]      = None
-    remix:              Optional[int]      = None
-    reject_product:     Optional[int]      = None
-    remarks:            Optional[str]      = None
+    date:            Optional[datetime]       = None
+    line_id:         Optional[int]            = None
+    shift_id:        Optional[int]            = None
+    feed_code_id:    Optional[int]            = None
+    production_plan: Optional[int]            = None
+    quantities:      Optional[dict[str, int]] = None
+    remarks:         Optional[str]            = None
 
 
 class ProductionOutputResponse(BaseModel):
-    id:                 int
-    date:               datetime
-    line_id:            int
-    shift_id:           int
-    feed_code_id:       Optional[int]
-    production_plan:    Optional[int]
-    finished_goods:     int
-    downgraded_product: int
-    wip:                int
-    remix:              int
-    reject_product:     int
-    # computed
-    actual_output:      int
-    good_product:       int
-    quality_rate:       float
-    remarks:            Optional[str]
-    is_active:          bool
-    created_at:         datetime
-    created_by_id:      Optional[int]
+    id:              str                  # group_id
+    date:            datetime
+    line_id:         int
+    shift_id:        int
+    feed_code_id:    Optional[int]
+    production_plan: Optional[int]
+    # Quantities dinamis dari master_output_types {code: quantity}
+    quantities:      dict[str, int]       = {}
+    # Computed
+    actual_output:   int                  = 0
+    remarks:         Optional[str]
+    is_active:       bool
+    created_at:      datetime
+    created_by_id:   Optional[int]
     # Embedded names (denormalized untuk display)
-    line_name:          Optional[str] = None
-    shift_name:         Optional[str] = None
-    feed_code_code:     Optional[str] = None
+    line_name:       Optional[str]        = None
+    shift_name:      Optional[str]        = None
+    feed_code_code:  Optional[str]        = None
 
     model_config = {"from_attributes": True}
 

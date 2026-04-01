@@ -135,6 +135,25 @@ class MasterStandardThroughput(PlantBase):
     feed_code: Mapped["MasterFeedCode"] = relationship("MasterFeedCode", back_populates="standard_throughputs")
 
 
+# ─── Master Output Type ───────────────────────────────────────────────────────
+class MasterOutputType(PlantBase):
+    
+    __tablename__ = "master_output_types"
+
+    id:            Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code:          Mapped[str]      = mapped_column(String(50), unique=True, nullable=False)   # e.g. finished_goods
+    name:          Mapped[str]      = mapped_column(String(100), nullable=False)               # e.g. Finished Goods
+    category:      Mapped[str]      = mapped_column(String(50), nullable=False)               # e.g. FG
+    is_good_product: Mapped[bool]   = mapped_column(Boolean, default=False)                   # True = dihitung sbg good product
+    sort_order:    Mapped[int]      = mapped_column(Integer, default=0)
+    remarks:       Mapped[str|None] = mapped_column(String(500))
+    is_active:     Mapped[bool]     = mapped_column(Boolean, default=True)
+    created_at:    Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_by_id: Mapped[int|None] = mapped_column(Integer, nullable=True)
+    updated_at:    Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id: Mapped[int|None] = mapped_column(Integer, nullable=True)
+
+
 # ─── Production Output ───────────────────────────────────────────────────────
 OUTPUT_TYPE_CATEGORY: dict[str, str] = {
     "finished_goods":     "FG",
@@ -144,6 +163,14 @@ OUTPUT_TYPE_CATEGORY: dict[str, str] = {
     "reject_product":     "REJECT",
 }
 OUTPUT_TYPES = tuple(OUTPUT_TYPE_CATEGORY.keys())
+
+DEFAULT_OUTPUT_TYPES = [
+    {"code": "finished_goods",     "name": "Finished Goods",     "category": "FG",         "is_good_product": True,  "sort_order": 1},
+    {"code": "downgraded_product", "name": "Downgraded Product", "category": "DOWNGRADED", "is_good_product": False, "sort_order": 2},
+    {"code": "wip",                "name": "WIP",                "category": "WIP",        "is_good_product": False, "sort_order": 3},
+    {"code": "remix",              "name": "Remix",              "category": "REMIX",      "is_good_product": False, "sort_order": 4},
+    {"code": "reject_product",     "name": "Reject",             "category": "REJECT",     "is_good_product": False, "sort_order": 5},
+]
 
 
 class ProductionOutput(PlantBase):

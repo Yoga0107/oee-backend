@@ -19,6 +19,7 @@ from app.models.plant_schema import (
     MasterMachineLoss,
     MasterShift, MasterFeedCode, MasterLine, MasterStandardThroughput,
     MergedLine, MergedLineDetail,
+    MasterOutputType, DEFAULT_OUTPUT_TYPES,
 )
 from app.schemas.master import (
     MachineLossLvl1Create, MachineLossLvl1Update, MachineLossLvl1Response,
@@ -30,6 +31,7 @@ from app.schemas.master import (
     LineCreate, LineUpdate, LineResponse,
     StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse,
     MergedLineCreate, MergedLineUpdate, MergedLineResponse, MergedLineMemberResponse,
+    OutputTypeCreate, OutputTypeUpdate, OutputTypeResponse,
 )
 
 router = APIRouter(prefix="/master", tags=["Master Data"])
@@ -490,3 +492,74 @@ def delete_merged_line(item_id: int, current_user: CurrentUser, plant: CurrentPl
     item = db.query(MergedLine).filter(MergedLine.id == item_id).first()
     if not item: raise HTTPException(404, "Merged line not found")
     item.is_active = False; item.updated_by_id = current_user.id; db.commit()
+
+
+# ════════════════════════════════════════════════════════
+# OUTPUT TYPES (Master Output Type)
+# ════════════════════════════════════════════════════════
+
+def _seed_output_types(db) -> None:
+    """Seed default output types if table is empty."""
+    if db.query(MasterOutputType).count() == 0:
+        for d in DEFAULT_OUTPUT_TYPES:
+            db.add(MasterOutputType(**d))
+        db.commit()
+
+
+@router.get("/output-types", response_model=list[OutputTypeResponse])
+def get_output_types(current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    _seed_output_types(db)
+    return (
+        db.query(MasterOutputType)
+        .order_by(MasterOutputType.sort_order, MasterOutputType.id)
+        .all()
+    )
+
+
+@router.get("/output-types/active", response_model=list[OutputTypeResponse])
+def get_active_output_types(current_user: CurrentUser, plant: CurrentPlant):
+    """Return only active output types — dipakai oleh form input."""
+    db = _db(plant)
+    _seed_output_types(db)
+    return (
+        db.query(MasterOutputType)
+        .filter(MasterOutputType.is_active == True)
+        .order_by(MasterOutputType.sort_order, MasterOutputType.id)
+        .all()
+    )
+
+
+@router.post("/output-types", response_model=OutputTypeResponse, status_code=201)
+def create_output_type(payload: OutputTypeCreate, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    existing = db.query(MasterOutputType).filter(MasterOutputType.code == payload.code).first()
+    if existing:
+        raise HTTPException(400, f"Kode output type '{payload.code}' sudah digunakan")
+    item = MasterOutputType(**payload.model_dump(), created_by_id=current_user.id)
+    db.add(item); db.commit(); db.refresh(item)
+    return item
+
+
+@router.put("/output-types/{item_id}", response_model=OutputTypeResponse)
+def update_output_type(item_id: int, payload: OutputTypeUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(MasterOutputType).filter(MasterOutputType.id == item_id).first()
+    if not item:
+        raise HTTPException(404, "Output type tidak ditemukan")
+    for k, v in payload.model_dump(exclude_none=True).items():
+        setattr(item, k, v)
+    item.updated_by_id = current_user.id
+    db.commit(); db.refresh(item)
+    return item
+
+
+@router.delete("/output-types/{item_id}", status_code=204)
+def delete_output_type(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(MasterOutputType).filter(MasterOutputType.id == item_id).first()
+    if not item:
+        raise HTTPException(404, "Output type tidak ditemukan")
+    item.is_active = False
+    item.updated_by_id = current_user.id
+    db.commit()

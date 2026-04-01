@@ -15,7 +15,7 @@ from app.core.deps import CurrentUser, CurrentPlant
 from app.models.plant_schema import (
     ProductionOutput, OUTPUT_TYPE_CATEGORY, OUTPUT_TYPES,
     MachineLossInput, MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
-    MasterLine, MasterShift, MasterFeedCode,
+    MasterLine, MasterShift, MasterFeedCode, MasterOutputType, DEFAULT_OUTPUT_TYPES,
 )
 from app.schemas.input import (
     ProductionOutputCreate, ProductionOutputUpdate, ProductionOutputResponse,
@@ -41,52 +41,46 @@ def _db(plant: CurrentPlant) -> Session:
     return next(get_plant_db(plant.schema_name))
 
 
-def _compute_derived(fg, dg, wip, remix, rej):
-    actual = fg + dg + wip + remix + rej
-    good = fg
-    qr = round((good / actual * 100), 2) if actual > 0 else 0.0
-    return actual, good, qr
+def _get_output_types(db) -> list:
+    """Return active output types ordered by sort_order; seed defaults if empty."""
+    if db.query(MasterOutputType).count() == 0:
+        for d in DEFAULT_OUTPUT_TYPES:
+            db.add(MasterOutputType(**d))
+        db.commit()
+    return (
+        db.query(MasterOutputType)
+        .filter(MasterOutputType.is_active == True)
+        .order_by(MasterOutputType.sort_order, MasterOutputType.id)
+        .all()
+    )
 
 
 def _build_group_response(rows: list) -> dict:
     """
     Flatten a list of ProductionOutput rows sharing the same group_id into
-    a single response dict that mirrors the old single-row API shape.
-    The frontend does not need to change.
+    a single response dict. quantities berisi {output_type_code: quantity}.
     """
     if not rows:
         return {}
-    # Use the first row for shared fields
     ref = rows[0]
-    qty = {r.output_type: r.quantity for r in rows}
-    fg  = qty.get("finished_goods",     0)
-    dg  = qty.get("downgraded_product", 0)
-    wip = qty.get("wip",                0)
-    rmx = qty.get("remix",              0)
-    rej = qty.get("reject_product",     0)
-    actual, good, qr = _compute_derived(fg, dg, wip, rmx, rej)
+    quantities = {r.output_type: r.quantity for r in rows}
+    actual_output = sum(quantities.values())
     return {
-        "id":                 ref.group_id,   # group_id serves as the "record id" for the UI
-        "date":               ref.date,
-        "line_id":            ref.line_id,
-        "shift_id":           ref.shift_id,
-        "feed_code_id":       ref.feed_code_id,
-        "production_plan":    ref.production_plan,
-        "finished_goods":     fg,
-        "downgraded_product": dg,
-        "wip":                wip,
-        "remix":              rmx,
-        "reject_product":     rej,
-        "actual_output":      actual,
-        "good_product":       good,
-        "quality_rate":       qr,
-        "remarks":            ref.remarks,
-        "is_active":          ref.is_active,
-        "created_at":         ref.created_at,
-        "created_by_id":      ref.created_by_id,
-        "line_name":          ref.line.name  if ref.line      else None,
-        "shift_name":         ref.shift.name if ref.shift     else None,
-        "feed_code_code":     ref.feed_code.code if ref.feed_code else None,
+        "id":              ref.group_id,
+        "date":            ref.date,
+        "line_id":         ref.line_id,
+        "shift_id":        ref.shift_id,
+        "feed_code_id":    ref.feed_code_id,
+        "production_plan": ref.production_plan,
+        "quantities":      quantities,
+        "actual_output":   actual_output,
+        "remarks":         ref.remarks,
+        "is_active":       ref.is_active,
+        "created_at":      ref.created_at,
+        "created_by_id":   ref.created_by_id,
+        "line_name":       ref.line.name      if ref.line      else None,
+        "shift_name":      ref.shift.name     if ref.shift     else None,
+        "feed_code_code":  ref.feed_code.code if ref.feed_code else None,
     }
 
 
@@ -231,24 +225,20 @@ def create_production_output(payload: ProductionOutputCreate, current_user: Curr
     if payload.feed_code_id:
         if not db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.feed_code_id, MasterFeedCode.is_active == True).first():
             raise HTTPException(404, "Kode pakan tidak ditemukan")
-    # 1 submit = 5 rows, semua sharing group_id yang sama
+    # 1 submit = N rows (1 per active output type), semua sharing group_id
+    output_types = _get_output_types(db)
+    if not output_types:
+        raise HTTPException(400, "Tidak ada output type aktif. Konfigurasi master output type terlebih dahulu.")
     gid = str(uuid.uuid4())
-    qty_map = {
-        "finished_goods":     payload.finished_goods,
-        "downgraded_product": payload.downgraded_product,
-        "wip":                payload.wip,
-        "remix":              payload.remix,
-        "reject_product":     payload.reject_product,
-    }
     new_rows = []
-    for otype in OUTPUT_TYPES:
+    for ot in output_types:
         row = ProductionOutput(
             group_id=gid,
             date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
             feed_code_id=payload.feed_code_id, production_plan=payload.production_plan,
-            output_type=otype,
-            category=OUTPUT_TYPE_CATEGORY[otype],
-            quantity=qty_map[otype],
+            output_type=ot.code,
+            category=ot.category,
+            quantity=payload.quantities.get(ot.code, 0),
             remarks=payload.remarks,
             created_by_id=current_user.id,
         )
@@ -275,14 +265,14 @@ def update_production_output(group_id: str, payload: ProductionOutputUpdate, cur
             raise HTTPException(404, "Kode pakan tidak ditemukan")
     # Shared fields — apply to all rows in the group
     shared_fields = {"date", "line_id", "shift_id", "feed_code_id", "production_plan", "remarks"}
-    qty_fields    = {"finished_goods", "downgraded_product", "wip", "remix", "reject_product"}
+    new_quantities = data.pop("quantities", None)  # {output_type_code: quantity}
     for row in rows:
         for k, v in data.items():
             if k in shared_fields:
                 setattr(row, k, v)
-        # Update quantity for this row's output_type
-        if row.output_type in data and row.output_type in qty_fields:
-            row.quantity = data[row.output_type]
+        # Update quantity dinamis dari quantities dict
+        if new_quantities is not None and row.output_type in new_quantities:
+            row.quantity = new_quantities[row.output_type]
         row.updated_by_id = current_user.id
     db.commit()
     for r in rows: db.refresh(r)
@@ -437,18 +427,21 @@ def export_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
                 else:
                     c.fill = PatternFill("solid", fgColor="FEE2E2"); c.font = Font(color="7F1D1D", bold=True, size=9, name="Calibri")
 
-    # Import Template sheet
+    # Import Template sheet (dynamic columns berdasarkan active output types)
     ws2 = wb.create_sheet("Import Template")
-    _title_rows(ws2, "Import Template  |  Production Output", 11, "059669")
-    IH = [("date\n(YYYY-MM-DD)",18),("line_name",18),("shift_name",18),
-          ("feed_code\n(opsional)",16),("production_plan\n(kg)",16),("finished_goods\n(kg)",16),
-          ("downgraded_product\n(kg)",20),("wip\n(kg)",12),("remix\n(kg)",12),
-          ("reject_product\n(kg)",16),("remarks\n(opsional)",24)]
+    n_tmpl_cols = 6 + len(output_types) + 1  # fixed + output types + remarks
+    _title_rows(ws2, "Import Template  |  Production Output", n_tmpl_cols, "059669")
+    IH_FIXED = [("date\n(YYYY-MM-DD)",18),("line_name",18),("shift_name",18),
+                ("feed_code\n(opsional)",16),("production_plan\n(kg)",16)]
+    IH_OT    = [(f"{ot.code}\n(kg)", 16) for ot in output_types]
+    IH_TRAIL = [("remarks\n(opsional)",24)]
+    IH_ALL   = IH_FIXED + IH_OT + IH_TRAIL
     ws2.row_dimensions[3].height = 42
-    for ci, (h, w) in enumerate(IH, 1):
+    for ci, (h, w) in enumerate(IH_ALL, 1):
         c = ws2.cell(row=3, column=ci, value=h); _hdr(c, "059669")
         ws2.column_dimensions[get_column_letter(ci)].width = w
-    for ci, val in enumerate(["2025-01-15","LINE-01","Shift 1","P001",5000,4500,200,100,100,100,"Contoh data"], 1):
+    sample_row = ["2025-01-15","LINE-01","Shift 1","P001",5000] + [100]*len(output_types) + ["Contoh data"]
+    for ci, val in enumerate(sample_row, 1):
         c = ws2.cell(row=4, column=ci, value=val)
         c.fill = PatternFill("solid", fgColor="F0FDF4"); c.font = Font(size=9, italic=True, name="Calibri")
         c.alignment = Alignment(horizontal="center", vertical="center"); c.border = _border()
@@ -502,16 +495,20 @@ async def import_production_outputs(current_user: CurrentUser, plant: CurrentPla
 
     ws = wb["Import Template"]
     db = _db(plant)
-    lines  = {l.name.strip().lower(): l for l in db.query(MasterLine).filter(MasterLine.is_active == True).all()}
-    shifts = {s.name.strip().lower(): s for s in db.query(MasterShift).filter(MasterShift.is_active == True).all()}
-    fcodes = {f.code.strip().lower(): f for f in db.query(MasterFeedCode).filter(MasterFeedCode.is_active == True).all()}
+    lines        = {l.name.strip().lower(): l for l in db.query(MasterLine).filter(MasterLine.is_active == True).all()}
+    shifts       = {s.name.strip().lower(): s for s in db.query(MasterShift).filter(MasterShift.is_active == True).all()}
+    fcodes       = {f.code.strip().lower(): f for f in db.query(MasterFeedCode).filter(MasterFeedCode.is_active == True).all()}
+    output_types = _get_output_types(db)  # dynamic output types dari master
+
+    # Kolom template: date(0), line(1), shift(2), fc(3), plan(4), ot[0..n-1](5..5+n-1), remarks(5+n)
+    OT_START = 5
 
     created, errors = 0, []
     for rn, row in enumerate(ws.iter_rows(min_row=4, values_only=True), start=4):
         if not any(row): continue
-        cells = list(row) + [None]*11
-        date_val, line_nm, shift_nm, fc_nm = cells[0], cells[1], cells[2], cells[3]
-        plan, fg, dg, wip, remix, rej, remarks = cells[4], cells[5], cells[6], cells[7], cells[8], cells[9], cells[10]
+        cells = list(row) + [None] * (OT_START + len(output_types) + 2)
+        date_val, line_nm, shift_nm, fc_nm, plan = cells[0], cells[1], cells[2], cells[3], cells[4]
+        remarks = cells[OT_START + len(output_types)]
         errs = []
         try:
             parsed_date = dt.fromisoformat(str(date_val).strip()) if isinstance(date_val, str) else dt.combine(date_val, dt.min.time())
@@ -530,25 +527,20 @@ async def import_production_outputs(current_user: CurrentUser, plant: CurrentPla
                 return x
             except:
                 errs.append(f"{lbl} harus angka >= 0"); return 0
-        i_plan=si(plan,"production_plan"); i_fg=si(fg,"finished_goods"); i_dg=si(dg,"downgraded_product")
-        i_wip=si(wip,"wip"); i_rmx=si(remix,"remix"); i_rej=si(rej,"reject_product")
+        i_plan = si(plan, "production_plan")
+        qty_map = {}
+        for idx, ot in enumerate(output_types):
+            qty_map[ot.code] = si(cells[OT_START + idx], ot.code)
         if errs: errors.append({"row": rn, "errors": errs}); continue
         gid = str(uuid.uuid4())
-        qty_map = {
-            "finished_goods":     i_fg,
-            "downgraded_product": i_dg,
-            "wip":                i_wip,
-            "remix":              i_rmx,
-            "reject_product":     i_rej,
-        }
-        for otype in OUTPUT_TYPES:
+        for ot in output_types:
             db.add(ProductionOutput(
                 group_id=gid,
                 date=parsed_date, line_id=lo.id, shift_id=so.id,
                 feed_code_id=fco.id if fco else None, production_plan=i_plan,
-                output_type=otype,
-                category=OUTPUT_TYPE_CATEGORY[otype],
-                quantity=qty_map[otype],
+                output_type=ot.code,
+                category=ot.category,
+                quantity=qty_map.get(ot.code, 0),
                 remarks=str(remarks).strip() if remarks else None,
                 created_by_id=current_user.id,
             ))

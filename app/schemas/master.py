@@ -233,3 +233,36 @@ class MergedLineResponse(BaseModel):
     created_by_id: Optional[int] = None
     members: list[MergedLineMemberResponse] = []
     model_config = {"from_attributes": True}
+
+
+# ─── Output Type ──────────────────────────────────────────────────────────────
+class OutputTypeCreate(BaseModel):
+    code:            str
+    name:            str
+    category:        str
+    is_good_product: bool           = False
+    sort_order:      int            = 0
+    remarks:         Optional[str]  = None
+
+
+class OutputTypeUpdate(BaseModel):
+    name:            Optional[str]  = None
+    category:        Optional[str]  = None
+    is_good_product: Optional[bool] = None
+    sort_order:      Optional[int]  = None
+    remarks:         Optional[str]  = None
+    is_active:       Optional[bool] = None
+
+
+class OutputTypeResponse(BaseModel):
+    id:              int
+    code:            str
+    name:            str
+    category:        str
+    is_good_product: bool
+    sort_order:      int
+    remarks:         Optional[str]
+    is_active:       bool
+    created_at:      datetime
+    created_by_id:   Optional[int]
+    model_config = {"from_attributes": True}
