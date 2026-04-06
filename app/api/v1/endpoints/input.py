@@ -178,118 +178,10 @@ def _title_rows(ws, title, ncols, bg):
 # PRODUCTION OUTPUTS – CRUD
 # ════════════════════════════════════════════════════════
 
-@router.get("/production-outputs", response_model=list[ProductionOutputResponse])
-def list_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
-    date_from: str | None = None, date_to: str | None = None,
-    line_id: int | None = None, shift_id: int | None = None):
-    db = _db(plant)
-    q = db.query(ProductionOutput).filter(ProductionOutput.is_active == True)
-    if date_from: q = q.filter(ProductionOutput.date >= dt.fromisoformat(date_from))
-    if date_to:   q = q.filter(ProductionOutput.date <= dt.fromisoformat(date_to + "T23:59:59"))
-    if line_id:   q = q.filter(ProductionOutput.line_id == line_id)
-    if shift_id:  q = q.filter(ProductionOutput.shift_id == shift_id)
-    rows = q.order_by(ProductionOutput.date.desc(), ProductionOutput.group_id).all()
 
-    # Auto-backfill rows with NULL group_id (data lama sebelum migration dijalankan).
-    needs_commit = False
-    for r in rows:
-        if not r.group_id:
-            r.group_id = str(uuid.uuid4())
-            if not r.output_type:
-                r.output_type = "finished_goods"
-                r.category    = "FG"
-                r.quantity     = 0
-            needs_commit = True
-    if needs_commit:
-        db.commit()
-        for r in rows: db.refresh(r)
-
-    # Group rows by group_id preserving date-desc order
-    seen: dict[str, list] = {}
-    order: list[str] = []
-    for r in rows:
-        if r.group_id not in seen:
-            seen[r.group_id] = []
-            order.append(r.group_id)
-        seen[r.group_id].append(r)
-    return [_build_group_response(seen[gid]) for gid in order]
-
-
-@router.post("/production-outputs", response_model=ProductionOutputResponse, status_code=201)
-def create_production_output(payload: ProductionOutputCreate, current_user: CurrentUser, plant: CurrentPlant):
-    db = _db(plant)
-    if not db.query(MasterLine).filter(MasterLine.id == payload.line_id, MasterLine.is_active == True).first():
-        raise HTTPException(404, "Line tidak ditemukan")
-    if not db.query(MasterShift).filter(MasterShift.id == payload.shift_id, MasterShift.is_active == True).first():
-        raise HTTPException(404, "Shift tidak ditemukan")
-    if payload.feed_code_id:
-        if not db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.feed_code_id, MasterFeedCode.is_active == True).first():
-            raise HTTPException(404, "Kode pakan tidak ditemukan")
-    # 1 submit = N rows (1 per active output type), semua sharing group_id
-    output_types = _get_output_types(db)
-    if not output_types:
-        raise HTTPException(400, "Tidak ada output type aktif. Konfigurasi master output type terlebih dahulu.")
-    gid = str(uuid.uuid4())
-    new_rows = []
-    for ot in output_types:
-        row = ProductionOutput(
-            group_id=gid,
-            date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
-            feed_code_id=payload.feed_code_id, production_plan=payload.production_plan,
-            output_type=ot.code,
-            category=ot.category,
-            quantity=payload.quantities.get(ot.code, 0),
-            remarks=payload.remarks,
-            created_by_id=current_user.id,
-        )
-        db.add(row)
-        new_rows.append(row)
-    db.commit()
-    for r in new_rows: db.refresh(r)
-    return _build_group_response(new_rows)
-
-
-@router.put("/production-outputs/{group_id}", response_model=ProductionOutputResponse)
-def update_production_output(group_id: str, payload: ProductionOutputUpdate, current_user: CurrentUser, plant: CurrentPlant):
-    """Update semua row dalam satu group (group_id). group_id = id dari response."""
-    db = _db(plant)
-    rows = _get_group(db, group_id)
-    if not rows: raise HTTPException(404, "Production output tidak ditemukan")
-    data = payload.model_dump(exclude_none=True)
-    if "line_id" in data and not db.query(MasterLine).filter(MasterLine.id == data["line_id"], MasterLine.is_active == True).first():
-        raise HTTPException(404, "Line tidak ditemukan")
-    if "shift_id" in data and not db.query(MasterShift).filter(MasterShift.id == data["shift_id"], MasterShift.is_active == True).first():
-        raise HTTPException(404, "Shift tidak ditemukan")
-    if "feed_code_id" in data and data["feed_code_id"]:
-        if not db.query(MasterFeedCode).filter(MasterFeedCode.id == data["feed_code_id"], MasterFeedCode.is_active == True).first():
-            raise HTTPException(404, "Kode pakan tidak ditemukan")
-    # Shared fields — apply to all rows in the group
-    shared_fields = {"date", "line_id", "shift_id", "feed_code_id", "production_plan", "remarks"}
-    new_quantities = data.pop("quantities", None)  # {output_type_code: quantity}
-    for row in rows:
-        for k, v in data.items():
-            if k in shared_fields:
-                setattr(row, k, v)
-        # Update quantity dinamis dari quantities dict
-        if new_quantities is not None and row.output_type in new_quantities:
-            row.quantity = new_quantities[row.output_type]
-        row.updated_by_id = current_user.id
-    db.commit()
-    for r in rows: db.refresh(r)
-    return _build_group_response(rows)
-
-
-@router.delete("/production-outputs/{group_id}", status_code=204)
-def delete_production_output(group_id: str, current_user: CurrentUser, plant: CurrentPlant):
-    """Soft-delete semua row dalam satu group."""
-    db = _db(plant)
-    rows = db.query(ProductionOutput).filter(ProductionOutput.group_id == group_id).all()
-    if not rows: raise HTTPException(404, "Production output tidak ditemukan")
-    for row in rows:
-        row.is_active = False
-        row.updated_by_id = current_user.id
-    db.commit()
-
+# ════════════════════════════════════════════════════════
+# PRODUCTION OUTPUTS – EXPORT & IMPORT (static routes — must be before /{group_id})
+# ════════════════════════════════════════════════════════
 
 @router.get("/production-outputs/by-type", response_model=list[dict])
 def list_output_by_type(
@@ -348,6 +240,7 @@ def export_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
     if line_id:   q = q.filter(ProductionOutput.line_id == line_id)
     if shift_id:  q = q.filter(ProductionOutput.shift_id == shift_id)
     items = q.order_by(ProductionOutput.date.desc()).all()
+    output_types = _get_output_types(db)  # dynamic output types for template sheet
 
     wb = Workbook()
     ws = wb.active
@@ -553,50 +446,127 @@ async def import_production_outputs(current_user: CurrentUser, plant: CurrentPla
 # MACHINE LOSS INPUTS – CRUD
 # ════════════════════════════════════════════════════════
 
-@router.get("/machine-loss-inputs", response_model=list[MachineLossInputResponse])
-def list_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPlant,
+
+# ════════════════════════════════════════════════════════
+# PRODUCTION OUTPUTS – CRUD
+# ════════════════════════════════════════════════════════
+
+@router.get("/production-outputs", response_model=list[ProductionOutputResponse])
+def list_production_outputs(current_user: CurrentUser, plant: CurrentPlant,
     date_from: str | None = None, date_to: str | None = None,
     line_id: int | None = None, shift_id: int | None = None):
     db = _db(plant)
-    q = db.query(MachineLossInput).filter(MachineLossInput.is_active == True)
-    if date_from: q = q.filter(MachineLossInput.date >= dt.fromisoformat(date_from))
-    if date_to:   q = q.filter(MachineLossInput.date <= dt.fromisoformat(date_to + "T23:59:59"))
-    if line_id:   q = q.filter(MachineLossInput.line_id == line_id)
-    if shift_id:  q = q.filter(MachineLossInput.shift_id == shift_id)
-    return [_build_loss_response(i) for i in q.order_by(MachineLossInput.date.desc(), MachineLossInput.id.desc()).all()]
+    q = db.query(ProductionOutput).filter(ProductionOutput.is_active == True)
+    if date_from: q = q.filter(ProductionOutput.date >= dt.fromisoformat(date_from))
+    if date_to:   q = q.filter(ProductionOutput.date <= dt.fromisoformat(date_to + "T23:59:59"))
+    if line_id:   q = q.filter(ProductionOutput.line_id == line_id)
+    if shift_id:  q = q.filter(ProductionOutput.shift_id == shift_id)
+    rows = q.order_by(ProductionOutput.date.desc(), ProductionOutput.group_id).all()
+
+    # Auto-backfill rows with NULL group_id (data lama sebelum migration dijalankan).
+    needs_commit = False
+    for r in rows:
+        if not r.group_id:
+            r.group_id = str(uuid.uuid4())
+            if not r.output_type:
+                r.output_type = "finished_goods"
+                r.category    = "FG"
+                r.quantity     = 0
+            needs_commit = True
+    if needs_commit:
+        db.commit()
+        for r in rows: db.refresh(r)
+
+    # Group rows by group_id preserving date-desc order
+    seen: dict[str, list] = {}
+    order: list[str] = []
+    for r in rows:
+        if r.group_id not in seen:
+            seen[r.group_id] = []
+            order.append(r.group_id)
+        seen[r.group_id].append(r)
+    return [_build_group_response(seen[gid]) for gid in order]
 
 
-@router.post("/machine-loss-inputs", response_model=MachineLossInputResponse, status_code=201)
-def create_machine_loss_input(payload: MachineLossInputCreate, current_user: CurrentUser, plant: CurrentPlant):
-    db = _db(plant); _validate_loss_refs(db, payload.model_dump())
-    item = MachineLossInput(date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
-        feed_code_id=payload.feed_code_id, loss_l1_id=payload.loss_l1_id,
-        loss_l2_id=payload.loss_l2_id, loss_l3_id=payload.loss_l3_id,
-        time_from=payload.time_from, time_to=payload.time_to,
-        duration_minutes=payload.duration_minutes, remarks=payload.remarks, created_by_id=current_user.id)
-    db.add(item); db.commit(); db.refresh(item); return _build_loss_response(item)
-
-
-@router.put("/machine-loss-inputs/{item_id}", response_model=MachineLossInputResponse)
-def update_machine_loss_input(item_id: int, payload: MachineLossInputUpdate, current_user: CurrentUser, plant: CurrentPlant):
+@router.post("/production-outputs", response_model=ProductionOutputResponse, status_code=201)
+def create_production_output(payload: ProductionOutputCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    item = db.query(MachineLossInput).filter(MachineLossInput.id == item_id, MachineLossInput.is_active == True).first()
-    if not item: raise HTTPException(404, "Machine loss input not found")
-    data = payload.model_dump(exclude_none=True); _validate_loss_refs(db, data)
-    for k, v in data.items(): setattr(item, k, v)
-    item.updated_by_id = current_user.id; db.commit(); db.refresh(item); return _build_loss_response(item)
+    if not db.query(MasterLine).filter(MasterLine.id == payload.line_id, MasterLine.is_active == True).first():
+        raise HTTPException(404, "Line tidak ditemukan")
+    if not db.query(MasterShift).filter(MasterShift.id == payload.shift_id, MasterShift.is_active == True).first():
+        raise HTTPException(404, "Shift tidak ditemukan")
+    if payload.feed_code_id:
+        if not db.query(MasterFeedCode).filter(MasterFeedCode.id == payload.feed_code_id, MasterFeedCode.is_active == True).first():
+            raise HTTPException(404, "Kode pakan tidak ditemukan")
+    # 1 submit = N rows (1 per active output type), semua sharing group_id
+    output_types = _get_output_types(db)
+    if not output_types:
+        raise HTTPException(400, "Tidak ada output type aktif. Konfigurasi master output type terlebih dahulu.")
+    gid = str(uuid.uuid4())
+    new_rows = []
+    for ot in output_types:
+        row = ProductionOutput(
+            group_id=gid,
+            date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
+            feed_code_id=payload.feed_code_id, production_plan=payload.production_plan,
+            output_type=ot.code,
+            category=ot.category,
+            quantity=payload.quantities.get(ot.code, 0),
+            remarks=payload.remarks,
+            created_by_id=current_user.id,
+        )
+        db.add(row)
+        new_rows.append(row)
+    db.commit()
+    for r in new_rows: db.refresh(r)
+    return _build_group_response(new_rows)
 
 
-@router.delete("/machine-loss-inputs/{item_id}", status_code=204)
-def delete_machine_loss_input(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+@router.put("/production-outputs/{group_id}", response_model=ProductionOutputResponse)
+def update_production_output(group_id: str, payload: ProductionOutputUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    """Update semua row dalam satu group (group_id). group_id = id dari response."""
     db = _db(plant)
-    item = db.query(MachineLossInput).filter(MachineLossInput.id == item_id).first()
-    if not item: raise HTTPException(404, "Machine loss input not found")
-    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
+    rows = _get_group(db, group_id)
+    if not rows: raise HTTPException(404, "Production output tidak ditemukan")
+    data = payload.model_dump(exclude_none=True)
+    if "line_id" in data and not db.query(MasterLine).filter(MasterLine.id == data["line_id"], MasterLine.is_active == True).first():
+        raise HTTPException(404, "Line tidak ditemukan")
+    if "shift_id" in data and not db.query(MasterShift).filter(MasterShift.id == data["shift_id"], MasterShift.is_active == True).first():
+        raise HTTPException(404, "Shift tidak ditemukan")
+    if "feed_code_id" in data and data["feed_code_id"]:
+        if not db.query(MasterFeedCode).filter(MasterFeedCode.id == data["feed_code_id"], MasterFeedCode.is_active == True).first():
+            raise HTTPException(404, "Kode pakan tidak ditemukan")
+    # Shared fields — apply to all rows in the group
+    shared_fields = {"date", "line_id", "shift_id", "feed_code_id", "production_plan", "remarks"}
+    new_quantities = data.pop("quantities", None)  # {output_type_code: quantity}
+    for row in rows:
+        for k, v in data.items():
+            if k in shared_fields:
+                setattr(row, k, v)
+        # Update quantity dinamis dari quantities dict
+        if new_quantities is not None and row.output_type in new_quantities:
+            row.quantity = new_quantities[row.output_type]
+        row.updated_by_id = current_user.id
+    db.commit()
+    for r in rows: db.refresh(r)
+    return _build_group_response(rows)
+
+
+@router.delete("/production-outputs/{group_id}", status_code=204)
+def delete_production_output(group_id: str, current_user: CurrentUser, plant: CurrentPlant):
+    """Soft-delete semua row dalam satu group."""
+    db = _db(plant)
+    rows = db.query(ProductionOutput).filter(ProductionOutput.group_id == group_id).all()
+    if not rows: raise HTTPException(404, "Production output tidak ditemukan")
+    for row in rows:
+        row.is_active = False
+        row.updated_by_id = current_user.id
+    db.commit()
+
 
 
 # ════════════════════════════════════════════════════════
-# MACHINE LOSS INPUTS – EXPORT
+# MACHINE LOSS INPUTS – EXPORT & IMPORT (static routes — must be before /{item_id})
 # ════════════════════════════════════════════════════════
 
 @router.get("/machine-loss-inputs/export")
@@ -752,3 +722,52 @@ async def import_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPl
         created += 1
     if created: db.commit()
     return {"imported": created, "errors": errors, "message": f"{created} baris berhasil diimport, {len(errors)} baris gagal."}
+# ════════════════════════════════════════════════════════
+# MACHINE LOSS INPUTS – CRUD
+# ════════════════════════════════════════════════════════
+
+@router.get("/machine-loss-inputs", response_model=list[MachineLossInputResponse])
+def list_machine_loss_inputs(current_user: CurrentUser, plant: CurrentPlant,
+    date_from: str | None = None, date_to: str | None = None,
+    line_id: int | None = None, shift_id: int | None = None):
+    db = _db(plant)
+    q = db.query(MachineLossInput).filter(MachineLossInput.is_active == True)
+    if date_from: q = q.filter(MachineLossInput.date >= dt.fromisoformat(date_from))
+    if date_to:   q = q.filter(MachineLossInput.date <= dt.fromisoformat(date_to + "T23:59:59"))
+    if line_id:   q = q.filter(MachineLossInput.line_id == line_id)
+    if shift_id:  q = q.filter(MachineLossInput.shift_id == shift_id)
+    return [_build_loss_response(i) for i in q.order_by(MachineLossInput.date.desc(), MachineLossInput.id.desc()).all()]
+
+
+@router.post("/machine-loss-inputs", response_model=MachineLossInputResponse, status_code=201)
+def create_machine_loss_input(payload: MachineLossInputCreate, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant); _validate_loss_refs(db, payload.model_dump())
+    item = MachineLossInput(date=payload.date, line_id=payload.line_id, shift_id=payload.shift_id,
+        feed_code_id=payload.feed_code_id, loss_l1_id=payload.loss_l1_id,
+        loss_l2_id=payload.loss_l2_id, loss_l3_id=payload.loss_l3_id,
+        time_from=payload.time_from, time_to=payload.time_to,
+        duration_minutes=payload.duration_minutes, remarks=payload.remarks, created_by_id=current_user.id)
+    db.add(item); db.commit(); db.refresh(item); return _build_loss_response(item)
+
+
+@router.put("/machine-loss-inputs/{item_id}", response_model=MachineLossInputResponse)
+def update_machine_loss_input(item_id: int, payload: MachineLossInputUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(MachineLossInput).filter(MachineLossInput.id == item_id, MachineLossInput.is_active == True).first()
+    if not item: raise HTTPException(404, "Machine loss input not found")
+    data = payload.model_dump(exclude_none=True); _validate_loss_refs(db, data)
+    for k, v in data.items(): setattr(item, k, v)
+    item.updated_by_id = current_user.id; db.commit(); db.refresh(item); return _build_loss_response(item)
+
+
+@router.delete("/machine-loss-inputs/{item_id}", status_code=204)
+def delete_machine_loss_input(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(MachineLossInput).filter(MachineLossInput.id == item_id).first()
+    if not item: raise HTTPException(404, "Machine loss input not found")
+    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
+
+
+# ════════════════════════════════════════════════════════
+# MACHINE LOSS INPUTS – EXPORT
+# ════════════════════════════════════════════════════════
