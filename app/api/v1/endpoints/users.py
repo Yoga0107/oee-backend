@@ -15,7 +15,7 @@ from app.schemas.auth import UserCreate, UserUpdate, UserResponse, ResetPassword
 from pydantic import BaseModel
 from typing import List
 
-VALID_MODULES = {"dashboard", "oee", "users", "plants", "settings"}
+VALID_MODULES = {"dashboard", "oee", "users", "plants", "settings", "equipment", "scm-turnover"}
 
 
 class ModulePermissionsPayload(BaseModel):
@@ -223,7 +223,7 @@ def set_user_modules(
     if invalid:
         raise HTTPException(
             status_code=400,
-            detail=f"Module tidak valid: {', '.join(invalid)}. Harus salah satu dari: {', '.join(VALID_MODULES)}",
+            detail=f"Module tidak valid: {', '.join(invalid)}. Harus salah satu dari: {', '.join(sorted(VALID_MODULES))}",
         )
 
     # Delete existing permissions
