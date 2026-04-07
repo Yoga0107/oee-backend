@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, plants, master, users, input, oee
+from app.api.v1.endpoints import auth, plants, master, users, input, oee, equipment
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -9,3 +9,4 @@ api_router.include_router(users.router)
 api_router.include_router(master.router)
 api_router.include_router(input.router)
 api_router.include_router(oee.router)
+api_router.include_router(equipment.router)

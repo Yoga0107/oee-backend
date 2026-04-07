@@ -263,3 +263,34 @@ class MergedLineDetail(PlantBase):
 
     merged_line: Mapped["MergedLine"] = relationship("MergedLine", back_populates="details")
     line:        Mapped["MasterLine"] = relationship("MasterLine")
+
+# ─── Equipment Tree ───────────────────────────────────────────────────────────
+
+class EquipmentTree(PlantBase):
+    """
+    master_equipment_tree — hierarki 5 level:
+      sistem → sub_sistem → unit_mesin → bagian_mesin → spare_part
+
+    Setiap baris = satu spare part lengkap dengan konteks hierarkinya.
+    Kolom spesifikasi, sku, bu bersifat opsional.
+    """
+    __tablename__ = "master_equipment_tree"
+
+    id:               Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sistem:           Mapped[str]      = mapped_column(String(200), nullable=False)
+    sub_sistem:       Mapped[str|None] = mapped_column(String(200))
+    unit_mesin:       Mapped[str|None] = mapped_column(String(200))
+    bagian_mesin:     Mapped[str|None] = mapped_column(String(200))
+    spare_part:       Mapped[str|None] = mapped_column(String(200))
+    spesifikasi:      Mapped[str|None] = mapped_column(String(500))
+    sku:              Mapped[str|None] = mapped_column(String(100))
+    bu:               Mapped[str|None] = mapped_column(String(50))
+    is_verified:      Mapped[bool]     = mapped_column(Boolean, default=False)
+    verified_by_id:   Mapped[int|None] = mapped_column(Integer, nullable=True)
+    verified_at:      Mapped[datetime|None] = mapped_column(DateTime, nullable=True)
+    remarks:          Mapped[str|None] = mapped_column(String(500))
+    is_active:        Mapped[bool]     = mapped_column(Boolean, default=True)
+    created_at:       Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_by_id:    Mapped[int|None] = mapped_column(Integer, nullable=True)
+    updated_at:       Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    updated_by_id:    Mapped[int|None] = mapped_column(Integer, nullable=True)

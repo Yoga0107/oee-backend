@@ -376,6 +376,37 @@ def migrate_plant_schema(schema_name: str) -> None:
         print(f"  ✅ Schema {s} migration complete")
 
 
+def migrate_equipment_tree(schema_name: str) -> None:
+    """Add master_equipment_tree table — safe to run multiple times."""
+    schema_engine = get_schema_engine(schema_name)
+    s = schema_name
+    with schema_engine.connect() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".master_equipment_tree (
+                id               SERIAL PRIMARY KEY,
+                sistem           VARCHAR(200) NOT NULL,
+                sub_sistem       VARCHAR(200),
+                unit_mesin       VARCHAR(200),
+                bagian_mesin     VARCHAR(200),
+                spare_part       VARCHAR(200),
+                spesifikasi      VARCHAR(500),
+                sku              VARCHAR(100),
+                bu               VARCHAR(50),
+                is_verified      BOOLEAN NOT NULL DEFAULT FALSE,
+                verified_by_id   INTEGER,
+                verified_at      TIMESTAMP,
+                remarks          VARCHAR(500),
+                is_active        BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+                created_by_id    INTEGER,
+                updated_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_by_id    INTEGER
+            )
+        """))
+        conn.commit()
+        print(f"  ✅ master_equipment_tree OK ({s})")
+
+
 def run_all_migrations():
     print("🔄 Running plant schema migrations...")
     schemas = get_all_plant_schemas()
@@ -385,6 +416,7 @@ def run_all_migrations():
     for schema in schemas:
         try:
             migrate_plant_schema(schema)
+            migrate_equipment_tree(schema)
         except Exception as e:
             print(f"  ❌ Migration error {schema}: {e}")
     print("✅ All plant schema migrations complete.")
