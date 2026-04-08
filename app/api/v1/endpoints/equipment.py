@@ -162,6 +162,285 @@ def get_stats(current_user: CurrentUser, plant: CurrentPlant):
         "unverified": total - verified,
         "by_sistem":  [{"sistem": s, "count": c} for s, c in by_sistem],
     }
+    
+    # ─── Tambahkan endpoint ini ke: oee-backend-master/app/api/v1/endpoints/equipment.py
+# Letakkan setelah endpoint /stats yang sudah ada
+# Pastikan import datetime sudah ada (sudah ada di file asli)
+# Tambahkan import tambahan di bagian atas file jika belum ada:
+#   from datetime import timedelta
+#   from collections import defaultdict
+
+
+# ─── Trend Analysis ───────────────────────────────────────────────────────────
+
+@router.get("/trend-analysis")
+def get_trend_analysis(
+    current_user: CurrentUser,
+    plant:        CurrentPlant,
+    period:       str = Query("monthly", regex="^(daily|weekly|monthly|quarterly|yearly)$"),
+    start_date:   str | None = Query(None, description="Format: YYYY-MM-DD"),
+    end_date:     str | None = Query(None, description="Format: YYYY-MM-DD"),
+    sistem:       str | None = Query(None),
+    group_by:     str = Query("level", regex="^(level|sistem|bu|verified)$"),
+):
+    """
+    Trend Analysis untuk pengumpulan data Equipment.
+    
+    Menampilkan:
+    - Jumlah data yang ditambahkan per periode waktu
+    - Perbandingan antar periode (apakah ada peningkatan/penurunan)
+    - Peak period (periode dengan penambahan terbanyak)
+    - Breakdown berdasarkan group_by (level, sistem, bu, atau status verifikasi)
+    - Growth rate per periode
+    
+    Params:
+    - period: daily | weekly | monthly | quarterly | yearly
+    - start_date: tanggal mulai filter (YYYY-MM-DD)
+    - end_date: tanggal akhir filter (YYYY-MM-DD)
+    - sistem: filter berdasarkan sistem tertentu
+    - group_by: level | sistem | bu | verified
+    """
+    from datetime import timedelta
+    from collections import defaultdict
+    import calendar
+
+    db = _db(plant)
+
+    # Base query — hanya ambil data aktif
+    q = db.query(EquipmentTree).filter(EquipmentTree.is_active == True)
+
+    # Filter sistem jika ada
+    if sistem:
+        q = q.filter(EquipmentTree.sistem.ilike(f"%{sistem}%"))
+
+    # Parse date range
+    try:
+        dt_start = dt.strptime(start_date, "%Y-%m-%d") if start_date else None
+        dt_end   = dt.strptime(end_date,   "%Y-%m-%d").replace(hour=23, minute=59, second=59) if end_date else None
+    except ValueError:
+        raise HTTPException(400, "Format tanggal tidak valid. Gunakan YYYY-MM-DD")
+
+    if dt_start:
+        q = q.filter(EquipmentTree.created_at >= dt_start)
+    if dt_end:
+        q = q.filter(EquipmentTree.created_at <= dt_end)
+
+    items = q.order_by(EquipmentTree.created_at).all()
+
+    if not items:
+        return {
+            "period":       period,
+            "group_by":     group_by,
+            "total_records": 0,
+            "timeline":     [],
+            "summary":      {},
+            "peak_period":  None,
+            "growth_trend": [],
+            "breakdown":    [],
+        }
+
+    # ── Helper: format period key ─────────────────────────────────────────────
+    def get_period_key(d: dt) -> str:
+        if period == "daily":
+            return d.strftime("%Y-%m-%d")
+        elif period == "weekly":
+            # ISO week: YYYY-WNN
+            year, week, _ = d.isocalendar()
+            return f"{year}-W{week:02d}"
+        elif period == "monthly":
+            return d.strftime("%Y-%m")
+        elif period == "quarterly":
+            q_num = (d.month - 1) // 3 + 1
+            return f"{d.year}-Q{q_num}"
+        else:  # yearly
+            return str(d.year)
+
+    def get_period_label(key: str) -> str:
+        """Ubah period key menjadi label yang lebih readable."""
+        if period == "daily":
+            try:
+                d = dt.strptime(key, "%Y-%m-%d")
+                return d.strftime("%d %b %Y")
+            except:
+                return key
+        elif period == "weekly":
+            # "2024-W03" → "Minggu 3, 2024"
+            parts = key.split("-W")
+            if len(parts) == 2:
+                return f"Minggu {parts[1]}, {parts[0]}"
+            return key
+        elif period == "monthly":
+            try:
+                d = dt.strptime(key, "%Y-%m")
+                return d.strftime("%B %Y")
+            except:
+                return key
+        elif period == "quarterly":
+            parts = key.split("-")
+            if len(parts) == 2:
+                return f"{parts[1]} {parts[0]}"
+            return key
+        else:  # yearly
+            return key
+
+    # ── Grouping helper untuk breakdown ──────────────────────────────────────
+    def get_group_key(item: EquipmentTree) -> str:
+        if group_by == "level":
+            # Tentukan level paling dalam yang terisi
+            if item.spare_part:    return "spare_part"
+            if item.bagian_mesin:  return "bagian_mesin"
+            if item.unit_mesin:    return "unit_mesin"
+            if item.sub_sistem:    return "sub_sistem"
+            return "sistem"
+        elif group_by == "sistem":
+            return item.sistem or "—"
+        elif group_by == "bu":
+            return item.bu or "Tanpa BU"
+        elif group_by == "verified":
+            return "Verified" if item.is_verified else "Pending"
+        return "—"
+
+    # ── Build timeline data ───────────────────────────────────────────────────
+    timeline_counts: dict[str, int] = defaultdict(int)
+    timeline_breakdown: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    # Kumpulkan semua verified_at juga untuk trend verifikasi
+    verify_timeline: dict[str, int] = defaultdict(int)
+
+    for item in items:
+        pk = get_period_key(item.created_at)
+        timeline_counts[pk] += 1
+        gk = get_group_key(item)
+        timeline_breakdown[pk][gk] += 1
+
+        # Track verifikasi berdasarkan verified_at
+        if item.verified_at:
+            vpk = get_period_key(item.verified_at)
+            verify_timeline[vpk] += 1
+
+    # Urutkan berdasarkan key (kronologis)
+    sorted_periods = sorted(timeline_counts.keys())
+
+    # ── Hitung growth rate ────────────────────────────────────────────────────
+    growth_trend = []
+    prev_count   = None
+    for pk in sorted_periods:
+        count = timeline_counts[pk]
+        if prev_count is not None and prev_count > 0:
+            growth = round(((count - prev_count) / prev_count) * 100, 1)
+        elif prev_count == 0 and count > 0:
+            growth = 100.0
+        else:
+            growth = 0.0
+        growth_trend.append({
+            "period":      pk,
+            "label":       get_period_label(pk),
+            "count":       count,
+            "growth_rate": growth,
+            "trend":       "up" if growth > 0 else ("down" if growth < 0 else "stable"),
+        })
+        prev_count = count
+
+    # ── Peak period ───────────────────────────────────────────────────────────
+    peak_period = None
+    if timeline_counts:
+        peak_key   = max(timeline_counts, key=lambda k: timeline_counts[k])
+        peak_count = timeline_counts[peak_key]
+        peak_period = {
+            "period": peak_key,
+            "label":  get_period_label(peak_key),
+            "count":  peak_count,
+        }
+
+    # ── Build breakdown list (semua grup di semua periode) ────────────────────
+    all_groups = sorted(set(
+        gk for period_data in timeline_breakdown.values() for gk in period_data
+    ))
+
+    # Label mapping untuk level
+    level_labels = {
+        "sistem":       "Sistem",
+        "sub_sistem":   "Sub Sistem",
+        "unit_mesin":   "Unit Mesin",
+        "bagian_mesin": "Bagian Mesin",
+        "spare_part":   "Spare Part",
+    }
+
+    breakdown_series = []
+    for gk in all_groups:
+        series_data = []
+        for pk in sorted_periods:
+            series_data.append({
+                "period": pk,
+                "label":  get_period_label(pk),
+                "count":  timeline_breakdown[pk].get(gk, 0),
+            })
+        label = level_labels.get(gk, gk) if group_by == "level" else gk
+        total_in_group = sum(d["count"] for d in series_data)
+        breakdown_series.append({
+            "group":  gk,
+            "label":  label,
+            "total":  total_in_group,
+            "series": series_data,
+        })
+
+    # Urutkan breakdown berdasarkan total terbanyak
+    breakdown_series.sort(key=lambda x: x["total"], reverse=True)
+
+    # ── Summary statistics ────────────────────────────────────────────────────
+    counts         = [timeline_counts[pk] for pk in sorted_periods]
+    total_records  = sum(counts)
+    avg_per_period = round(total_records / len(counts), 1) if counts else 0
+    max_count      = max(counts) if counts else 0
+    min_count      = min(counts) if counts else 0
+
+    # Overall trend: bandingkan paruh pertama vs paruh kedua
+    if len(counts) >= 2:
+        mid       = len(counts) // 2
+        first_avg = sum(counts[:mid]) / mid if mid > 0 else 0
+        last_avg  = sum(counts[mid:]) / (len(counts) - mid) if (len(counts) - mid) > 0 else 0
+        if last_avg > first_avg * 1.05:
+            overall_trend = "increasing"
+        elif last_avg < first_avg * 0.95:
+            overall_trend = "decreasing"
+        else:
+            overall_trend = "stable"
+    else:
+        overall_trend = "stable"
+
+    # ── Full timeline (untuk chart utama) ─────────────────────────────────────
+    timeline = []
+    cumulative = 0
+    for pk in sorted_periods:
+        count = timeline_counts[pk]
+        cumulative += count
+        timeline.append({
+            "period":           pk,
+            "label":            get_period_label(pk),
+            "count":            count,
+            "cumulative":       cumulative,
+            "verified_count":   verify_timeline.get(pk, 0),
+        })
+
+    return {
+        "period":        period,
+        "group_by":      group_by,
+        "total_records": total_records,
+        "date_range": {
+            "start": items[0].created_at.isoformat() if items else None,
+            "end":   items[-1].created_at.isoformat() if items else None,
+        },
+        "timeline":      timeline,
+        "summary": {
+            "total_periods":   len(sorted_periods),
+            "avg_per_period":  avg_per_period,
+            "max_per_period":  max_count,
+            "min_per_period":  min_count,
+            "overall_trend":   overall_trend,
+        },
+        "peak_period":  peak_period,
+        "growth_trend": growth_trend,
+        "breakdown":    breakdown_series,
+    }
 
 
 # ─── Create ───────────────────────────────────────────────────────────────────
