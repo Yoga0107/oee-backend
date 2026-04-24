@@ -1,3 +1,23 @@
+"""
+app/api/v1/endpoints/oee.py
+───────────────────────────
+Endpoint OEE View — implementasi dari measurement.ipynb.
+
+Pipeline:
+  total_time → loading_time → operating_time → availability
+  actual/std throughput → performance
+  good_product/total_output → quality
+  availability × performance × quality / 10000 → OEE
+
+Endpoint:
+  GET /oee/time-metrics        → semua 5 metrik sekaligus
+  GET /oee/loading-time        → alias
+  GET /oee/operating-time      → alias
+  GET /oee/availability-rate   → alias
+  GET /oee/performance-rate    → alias
+  GET /oee/quality-rate        → alias
+"""
+
 from datetime import date
 from typing import Optional
 
@@ -9,8 +29,6 @@ from app.oee.engine import compute_time_metrics
 
 router = APIRouter(prefix="/oee", tags=["OEE"])
 
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_line_ids(raw: Optional[str]) -> Optional[list[int]]:
     if not raw:
@@ -46,24 +64,25 @@ def _meta(date_from, date_to, group_by):
     return {"date_from": str(date_from), "date_to": str(date_to), "group_by": group_by}
 
 
-# ─── Endpoint gabungan — return semua 5 metrik sekaligus ─────────────────────
+# ─── Endpoint utama — semua metrik sekaligus ─────────────────────────────────
 
 @router.get("/time-metrics")
 def get_time_metrics(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by:  str  = Query("daily"),
-    line_ids:  Optional[str] = Query(None),
+    date_from: date = Query(..., description="YYYY-MM-DD"),
+    date_to:   date = Query(..., description="YYYY-MM-DD"),
+    group_by:  str  = Query("daily", description="'daily' | 'monthly'"),
+    line_ids:  Optional[str] = Query(None, description="Comma-separated line IDs"),
 ):
     """
-    Endpoint utama — return Loading, Operating, Availability,
-    Performance, Quality sekaligus dari 4 DB query.
+    Semua metrik OEE: loading_time, operating_time, availability,
+    performance, quality, OEE — dari satu set query DB.
     """
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": data, **_meta(date_from, date_to, group_by)}
 
 
-# ─── Alias individual ─────────────────────────────────────────────────────────
+# ─── Alias individual ────────────────────────────────────────────────────────
 
 @router.get("/loading-time")
 def get_loading_time(
@@ -71,6 +90,7 @@ def get_loading_time(
     date_from: date = Query(...), date_to: date = Query(...),
     group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
 ):
+    """Loading Time = Total Time − Σ Scheduled Downtime"""
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": [
         {"date": r["date"],
@@ -87,6 +107,7 @@ def get_operating_time(
     date_from: date = Query(...), date_to: date = Query(...),
     group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
 ):
+    """Operating Time = Loading Time − Σ Operating Losses"""
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": [
         {"date": r["date"],
@@ -103,11 +124,11 @@ def get_availability_rate(
     date_from: date = Query(...), date_to: date = Query(...),
     group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
 ):
+    """Availability = Operating Time / Loading Time × 100%"""
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": [
         {"date": r["date"],
-         "lines": {lid: {**{k: d[k] for k in ("name","loading_h","operating_h",
-                             "total_h","sched_loss_h","op_loss_h")},
+         "lines": {lid: {**{k: d[k] for k in ("name","loading_h","operating_h","total_h","sched_loss_h","op_loss_h")},
                          "rate": d["availability"]}
                    for lid, d in r["lines"].items()},
          "all_line": r["all_line"]["availability"]}
@@ -121,15 +142,14 @@ def get_performance_rate(
     date_from: date = Query(...), date_to: date = Query(...),
     group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
 ):
-    """Performance Rate = actual_output / ideal_output × 100"""
+    """Performance = Actual Throughput / Std Throughput × 100%"""
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": [
         {"date": r["date"],
          "lines": {lid: {k: d[k] for k in ("name","operating_h","actual_output",
-                                             "ideal_output","performance")}
+                                             "actual_throughput","std_throughput","performance")}
                    for lid, d in r["lines"].items()},
-         "all_line": {k: r["all_line"][k] for k in
-                      ("actual_output","ideal_output","performance")}}
+         "all_line": {k: r["all_line"][k] for k in ("actual_output","performance")}}
         for r in data
     ], **_meta(date_from, date_to, group_by)}
 
@@ -140,14 +160,29 @@ def get_quality_rate(
     date_from: date = Query(...), date_to: date = Query(...),
     group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
 ):
-    """Quality Rate = good_product / actual_output × 100"""
+    """Quality = Good Product / Total Output × 100%"""
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": [
         {"date": r["date"],
-         "lines": {lid: {k: d[k] for k in ("name","actual_output",
-                                             "good_product","quality")}
+         "lines": {lid: {k: d[k] for k in ("name","actual_output","good_product","quality")}
                    for lid, d in r["lines"].items()},
-         "all_line": {k: r["all_line"][k] for k in
-                      ("actual_output","good_product","quality")}}
+         "all_line": {k: r["all_line"][k] for k in ("actual_output","good_product","quality")}}
+        for r in data
+    ], **_meta(date_from, date_to, group_by)}
+
+
+@router.get("/oee")
+def get_oee(
+    current_user: CurrentUser, plant: CurrentPlant,
+    date_from: date = Query(...), date_to: date = Query(...),
+    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+):
+    """OEE = Availability × Performance × Quality / 10000"""
+    data = _run(plant, date_from, date_to, group_by, line_ids)
+    return {"data": [
+        {"date": r["date"],
+         "lines": {lid: {k: d[k] for k in ("name","availability","performance","quality","oee")}
+                   for lid, d in r["lines"].items()},
+         "all_line": {k: r["all_line"][k] for k in ("availability","performance","quality","oee")}}
         for r in data
     ], **_meta(date_from, date_to, group_by)}

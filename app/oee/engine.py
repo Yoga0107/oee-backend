@@ -1,3 +1,21 @@
+"""
+app/oee/engine.py
+─────────────────
+Query layer — ambil data dari DB lalu panggil formulas.py.
+
+Menerjemahkan model SQLAlchemy → dict sederhana untuk formulas.py.
+Semua logika kalkulasi ada di formulas.py, bukan di sini.
+
+Query: 5 total
+  1. master_lines
+  2. master_shifts
+  3. merged_lines + details
+  4. master_standard_throughputs
+  5. machine_loss_inputs (+ l1 category)
+  6. production_outputs  (+ output_type.is_good_product)
+  7. active dates (union ML inputs + prod outputs)
+"""
+
 from datetime import date, datetime
 from typing import Optional
 from collections import defaultdict
@@ -9,32 +27,16 @@ from app.models.plant_schema import (
     MachineLossInput, MachineLossLvl1,
     MasterLine, MasterShift,
     MasterStandardThroughput,
+    MergedLine, MergedLineDetail,
     ProductionOutput, MasterOutputType,
 )
-from app.oee.formulas import (
-    calc_shift_hours, calc_loading_time, calc_operating_time,
-    calc_availability, calc_all_line_rate,
-    calc_ideal_output, calc_performance,
-    calc_quality,
-)
+from app.oee.formulas import compute_oee_metrics, SCHEDULED_L1, NON_OPERATING_L1s
 
-SCHEDULED_KEYWORDS = ("scheduled", "jadwal", "planned")
-
-
-def _is_scheduled(name: str) -> bool:
-    n = (name or "").lower()
-    return any(kw in n for kw in SCHEDULED_KEYWORDS)
-
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _to_date(v) -> date:
     return v.date() if isinstance(v, datetime) else v
 
-
-def _bk(d: date, group_by: str) -> str:
-    return d.strftime("%Y-%m") if group_by == "monthly" else d.strftime("%Y-%m-%d")
-
-
-# ─── Main engine ──────────────────────────────────────────────────────────────
 
 def compute_time_metrics(
     db:        Session,
@@ -43,28 +45,46 @@ def compute_time_metrics(
     group_by:  str = "daily",
     line_ids:  Optional[list[int]] = None,
 ) -> list[dict]:
+    """
+    Query DB dan compute semua OEE metrics menggunakan logika dari measurement.ipynb.
+    """
+    dt_from = datetime.combine(date_from, datetime.min.time())
+    dt_to   = datetime.combine(date_to,   datetime.max.time())
 
-    # ── Query 1: Lines & Shifts ───────────────────────────────────────────
+    # ── 1. Lines ──────────────────────────────────────────────────────────────
     line_q = db.query(MasterLine).filter(MasterLine.is_active == True)
     if line_ids:
         line_q = line_q.filter(MasterLine.id.in_(line_ids))
     lines = line_q.order_by(MasterLine.id).all()
     if not lines:
         return []
+    line_id_list = [l.id for l in lines]
+    lines_data   = [{"id": l.id, "name": l.name} for l in lines]
 
+    # ── 2. Shifts ─────────────────────────────────────────────────────────────
     shifts = db.query(MasterShift).filter(MasterShift.is_active == True).all()
     if not shifts:
         return []
+    shifts_data = [{"id": s.id, "name": s.name,
+                    "time_from": s.time_from, "time_to": s.time_to}
+                   for s in shifts]
 
-    line_id_list  = [l.id for l in lines]
-    line_map      = {l.id: l for l in lines}
-    total_shift_h = sum(calc_shift_hours(s.time_from, s.time_to) for s in shifts)
+    # ── 3. Merged lines ───────────────────────────────────────────────────────
+    merged_lines_raw = (
+        db.query(MergedLine)
+        .filter(MergedLine.is_active == True)
+        .all()
+    )
+    merged_lines_data: list[dict] = []
+    for ml in merged_lines_raw:
+        member_ids = [d.line_id for d in ml.details if d.line_id in set(line_id_list)]
+        if len(member_ids) >= 2:
+            member_names = [l.name for l in lines if l.id in set(member_ids)]
+            merged_name  = " & ".join(member_names)
+            merged_lines_data.append({"name": merged_name, "member_ids": member_ids})
 
-    dt_from = datetime.combine(date_from, datetime.min.time())
-    dt_to   = datetime.combine(date_to,   datetime.max.time())
-
-    # ── Query 2: Standard Throughput per (line, feed_code) ───────────────
-    tp_rows = (
+    # ── 4. Standard throughputs ───────────────────────────────────────────────
+    stp_rows = (
         db.query(
             MasterStandardThroughput.line_id,
             MasterStandardThroughput.feed_code_id,
@@ -73,12 +93,14 @@ def compute_time_metrics(
         .filter(MasterStandardThroughput.line_id.in_(line_id_list))
         .all()
     )
-    # throughput[line_id][feed_code_id] = std_throughput
-    throughput: dict[int, dict[int, float]] = defaultdict(dict)
-    for lid, fcid, stp in tp_rows:
-        throughput[lid][fcid] = float(stp)
+    # Notebook: std_throughput = std_output / final_operating_time
+    # Di model kita: standard_throughput sudah merupakan unit/jam
+    # Mapping: std_output = standard_throughput, final_op_time = 1 (sudah per jam)
+    std_tps = [{"line_id": r.line_id, "feed_code_id": r.feed_code_id,
+                "std_output": float(r.standard_throughput), "final_op_time": 1.0}
+               for r in stp_rows]
 
-    # ── Query 3: Machine losses (join L1 name) ────────────────────────────
+    # ── 5. Machine loss inputs ────────────────────────────────────────────────
     loss_rows = (
         db.query(
             MachineLossInput.line_id,
@@ -98,12 +120,27 @@ def compute_time_metrics(
         .all()
     )
 
-    # ── Query 4: Production outputs (join output_type for is_good_product) ─
+    loss_data = [
+        {
+            "line_id":       r.line_id,
+            "date":          _to_date(r.date),
+            "duration_min":  float(r.duration_minutes or 0),
+            "l1_name":       r.l1_name or "",
+            # Scheduled = L1 name exact match (dari notebook: where t2.name = 'Scheduled Downtime')
+            "is_scheduled":  (r.l1_name or "").strip() == SCHEDULED_L1,
+            # Operating loss = bukan Scheduled, bukan Performance Loss, bukan Defects
+            "is_operating":  (r.l1_name or "").strip() not in NON_OPERATING_L1s,
+        }
+        for r in loss_rows
+    ]
+    # Filter: hanya gunakan operating losses untuk operating_time (sesuai notebook)
+    loss_data_filtered = [r for r in loss_data if r["is_scheduled"] or r["is_operating"]]
+
+    # ── 6. Production outputs ─────────────────────────────────────────────────
     prod_rows = (
         db.query(
             ProductionOutput.line_id,
             ProductionOutput.date,
-            ProductionOutput.feed_code_id,
             ProductionOutput.quantity,
             MasterOutputType.is_good_product,
         )
@@ -118,137 +155,33 @@ def compute_time_metrics(
         )
         .all()
     )
-
-    # ── Proses loss rows ──────────────────────────────────────────────────
-    active_days: dict[int, set[date]]           = defaultdict(set)
-    sched_min:   dict[str, dict[int, float]]    = defaultdict(lambda: defaultdict(float))
-    op_min:      dict[str, dict[int, float]]    = defaultdict(lambda: defaultdict(float))
-
-    for line_id, dt, dur_min, l1_name in loss_rows:
-        d = _to_date(dt)
-        active_days[line_id].add(d)
-        bucket = _bk(d, group_by)
-        if _is_scheduled(l1_name or ""):
-            sched_min[bucket][line_id] += dur_min
-        else:
-            op_min[bucket][line_id]    += dur_min
-
-    # ── Proses production rows ────────────────────────────────────────────
-    # actual[bucket][line_id] = total actual output (semua tipe)
-    # good[bucket][line_id]   = total good product saja
-    # feed[bucket][line_id]   = set feed_code_id (untuk ambil std throughput)
-    actual: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    good:   dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    # Weighted throughput: {bk: {line_id: Σ(qty × stp) / Σqty}}
-    # Kita simpan numerator dan denominator terpisah
-    stp_num: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    stp_den: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-
-    for line_id, dt, feed_code_id, qty, is_good in prod_rows:
-        d = _to_date(dt)
-        active_days[line_id].add(d)
-        bucket = _bk(d, group_by)
-
-        actual[bucket][line_id] += qty
-        if is_good:
-            good[bucket][line_id] += qty
-
-        # Throughput per unit produksi (weighted by qty)
-        stp = throughput.get(line_id, {}).get(feed_code_id)
-        if stp and qty > 0:
-            stp_num[bucket][line_id] += qty * stp
-            stp_den[bucket][line_id] += qty
-
-    # ── total_time per (bucket, line_id) ─────────────────────────────────
-    total_h_map: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    for line_id, days in active_days.items():
-        for d in days:
-            if date_from <= d <= date_to:
-                total_h_map[_bk(d, group_by)][line_id] += total_shift_h
-
-    # ── Gabung semua bucket & kalkulasi ──────────────────────────────────
-    all_buckets = sorted(
-        set(total_h_map) | set(sched_min) | set(op_min) | set(actual)
-    )
-
-    results = []
-    for bk in all_buckets:
-        line_results: dict[int, dict] = {}
-
-        # Aggregator all_line
-        agg = {
-            "total_h": 0.0, "sched_h": 0.0, "op_loss_h": 0.0,
-            "load_list": [], "op_list": [],
-            "actual": 0.0, "good": 0.0,
-            "ideal_num": 0.0, "ideal_den": 0.0,
+    prod_data = [
+        {
+            "line_id":        r.line_id,
+            "date":           _to_date(r.date),
+            "quantity":       float(r.quantity or 0),
+            "is_good_product": bool(r.is_good_product),
         }
+        for r in prod_rows
+    ]
 
-        for lid in line_id_list:
-            total_h   = total_h_map[bk].get(lid, 0.0)
-            sched_h   = round(sched_min[bk].get(lid, 0.0) / 60, 4)
-            op_loss_h = round(op_min[bk].get(lid, 0.0)    / 60, 4)
+    # ── 7. Active dates per line (union ML + PO) ──────────────────────────────
+    active_days: dict[int, set] = defaultdict(set)
+    for r in loss_rows:
+        active_days[r.line_id].add(_to_date(r.date))
+    for r in prod_rows:
+        active_days[r.line_id].add(_to_date(r.date))
 
-            loading_h   = calc_loading_time(total_h, sched_h)
-            operating_h = calc_operating_time(loading_h, op_loss_h)
-            avail       = calc_availability(operating_h, loading_h)
-
-            # Throughput rata-rata tertimbang per kuantitas
-            _stp_n = stp_num[bk].get(lid, 0.0)
-            _stp_d = stp_den[bk].get(lid, 0.0)
-            avg_stp = (_stp_n / _stp_d) if _stp_d > 0 else None
-
-            act_qty  = actual[bk].get(lid, 0.0)
-            good_qty = good[bk].get(lid, 0.0)
-
-            ideal_h  = calc_ideal_output(operating_h, avg_stp) if avg_stp else 0.0
-            perf     = calc_performance(act_qty, ideal_h)
-            qual     = calc_quality(good_qty, act_qty)
-
-            line_results[lid] = {
-                "name"        : line_map[lid].name,
-                "total_h"     : round(total_h, 4),
-                "sched_loss_h": sched_h,
-                "op_loss_h"   : op_loss_h,
-                "loading_h"   : loading_h,
-                "operating_h" : operating_h,
-                "availability": avail,
-                "actual_output": act_qty,
-                "good_product" : good_qty,
-                "ideal_output" : ideal_h,
-                "performance"  : perf,
-                "quality"      : qual,
-            }
-
-            # Akumulasi all_line
-            agg["total_h"] += total_h
-            if loading_h > 0:
-                agg["load_list"].append(loading_h)
-                agg["op_list"].append(operating_h)
-            agg["actual"] += act_qty
-            agg["good"]   += good_qty
-            if avg_stp and operating_h > 0:
-                agg["ideal_num"] += operating_h * avg_stp
-                agg["ideal_den"] += operating_h
-
-        # all_line calculations
-        all_load = round(sum(agg["load_list"]), 4)
-        all_op   = round(sum(agg["op_list"]),   4)
-        all_ideal = round(agg["ideal_num"], 2) if agg["ideal_den"] > 0 else 0.0
-
-        results.append({
-            "date"  : bk,
-            "lines" : line_results,
-            "all_line": {
-                "total_h"      : round(agg["total_h"], 4),
-                "loading_h"    : all_load,
-                "operating_h"  : all_op,
-                "availability" : calc_all_line_rate(agg["op_list"], agg["load_list"]),
-                "actual_output": agg["actual"],
-                "good_product" : agg["good"],
-                "ideal_output" : all_ideal,
-                "performance"  : calc_performance(agg["actual"], all_ideal),
-                "quality"      : calc_quality(agg["good"], agg["actual"]),
-            },
-        })
-
-    return results
+    # ── Compute ───────────────────────────────────────────────────────────────
+    return compute_oee_metrics(
+        lines           = lines_data,
+        shifts          = shifts_data,
+        merged_lines    = merged_lines_data,
+        std_throughputs = std_tps,
+        loss_inputs     = loss_data_filtered,
+        prod_outputs    = prod_data,
+        active_days     = active_days,
+        date_from       = date_from,
+        date_to         = date_to,
+        group_by        = group_by,
+    )
