@@ -52,6 +52,12 @@ def list_users(admin: SuperUser, db: Session = Depends(get_db)):
     return [_build_response(u, db) for u in users]
 
 
+@router.get("/basic", response_model=list[dict])
+def list_users_basic(current_user: CurrentUser, db: Session = Depends(get_db)):
+    users = db.query(User.id, User.full_name, User.username).filter(User.is_active == True).order_by(User.id).all()
+    return [{"id": u.id, "full_name": u.full_name, "username": u.username} for u in users]
+
+
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def create_user(payload: UserCreate, admin: SuperUser, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == payload.username).first():

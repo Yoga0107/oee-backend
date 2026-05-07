@@ -126,6 +126,7 @@ class MasterStandardThroughput(PlantBase):
     feed_code_id:        Mapped[int]      = mapped_column(Integer, ForeignKey("master_feed_codes.id"), nullable=False)
     standard_throughput: Mapped[int]      = mapped_column(Integer, nullable=False)
     remarks:             Mapped[str|None] = mapped_column(String(500))
+    is_active:           Mapped[bool]     = mapped_column(Boolean, default=True)
     created_at:          Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     created_by_id:       Mapped[int|None] = mapped_column(Integer, nullable=True)
     updated_at:          Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -133,6 +134,24 @@ class MasterStandardThroughput(PlantBase):
 
     line:      Mapped["MasterLine"]     = relationship("MasterLine", back_populates="standard_throughputs")
     feed_code: Mapped["MasterFeedCode"] = relationship("MasterFeedCode", back_populates="standard_throughputs")
+    logs: Mapped[list["StandardThroughputLog"]] = relationship("StandardThroughputLog", back_populates="standard_throughput", order_by="StandardThroughputLog.id")
+
+
+class StandardThroughputLog(PlantBase):
+    __tablename__ = "standard_throughput_logs"
+
+    id:                      Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    standard_throughput_id:  Mapped[int]      = mapped_column(Integer, ForeignKey("master_standard_throughputs.id", ondelete="CASCADE"), nullable=False)
+    change_number:           Mapped[int]      = mapped_column(Integer, nullable=False)
+    old_throughput:          Mapped[int|None] = mapped_column(Integer)
+    new_throughput:          Mapped[int]      = mapped_column(Integer, nullable=False)
+    old_remarks:             Mapped[str|None] = mapped_column(String(500))
+    new_remarks:             Mapped[str|None] = mapped_column(String(500))
+    reason:                  Mapped[str|None] = mapped_column(String(1000))
+    changed_at:              Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    changed_by_id:           Mapped[int|None] = mapped_column(Integer, nullable=True)
+
+    standard_throughput: Mapped["MasterStandardThroughput"] = relationship("MasterStandardThroughput", back_populates="logs")
 
 
 # ─── Master Output Type ───────────────────────────────────────────────────────

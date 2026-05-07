@@ -1,21 +1,26 @@
 """
 app/api/v1/endpoints/oee.py
 ───────────────────────────
-Endpoint OEE View — implementasi dari measurement.ipynb.
+Endpoint OEE View.
 
-Pipeline:
-  total_time → loading_time → operating_time → availability
-  actual/std throughput → performance
-  good_product/total_output → quality
-  availability × performance × quality / 10000 → OEE
+Pipeline (sesuai measurement.ipynb):
+  total_time      = n_shifts × shift_hours × n_days          (deterministik)
+  loading_time    = total_time  - Σ scheduled_downtime
+  operating_time  = loading_time - Σ operating_losses
+  availability    = operating_time / loading_time × 100
+  performance     = actual_throughput / std_throughput × 100
+  quality         = good_product / total_output × 100
+  OEE             = A × P × Q / 10000
 
-Endpoint:
-  GET /oee/time-metrics        → semua 5 metrik sekaligus
-  GET /oee/loading-time        → alias
-  GET /oee/operating-time      → alias
-  GET /oee/availability-rate   → alias
-  GET /oee/performance-rate    → alias
-  GET /oee/quality-rate        → alias
+Endpoints:
+  GET /oee/time-metrics      semua metrik sekaligus
+  GET /oee/total-time        total time per line per bucket
+  GET /oee/loading-time      loading time + sched breakdown
+  GET /oee/operating-time    operating time + op breakdown
+  GET /oee/availability-rate
+  GET /oee/performance-rate
+  GET /oee/quality-rate
+  GET /oee/oee
 """
 
 from datetime import date
@@ -64,125 +69,393 @@ def _meta(date_from, date_to, group_by):
     return {"date_from": str(date_from), "date_to": str(date_to), "group_by": group_by}
 
 
-# ─── Endpoint utama — semua metrik sekaligus ─────────────────────────────────
+# ─── Semua metrik sekaligus ───────────────────────────────────────────────────
 
 @router.get("/time-metrics")
 def get_time_metrics(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(..., description="YYYY-MM-DD"),
-    date_to:   date = Query(..., description="YYYY-MM-DD"),
-    group_by:  str  = Query("daily", description="'daily' | 'monthly'"),
-    line_ids:  Optional[str] = Query(None, description="Comma-separated line IDs"),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """
-    Semua metrik OEE: loading_time, operating_time, availability,
-    performance, quality, OEE — dari satu set query DB.
-    """
     data = _run(plant, date_from, date_to, group_by, line_ids)
     return {"data": data, **_meta(date_from, date_to, group_by)}
 
 
-# ─── Alias individual ────────────────────────────────────────────────────────
+# ─── Total Time ───────────────────────────────────────────────────────────────
+
+@router.get("/total-time")
+def get_total_time(
+    current_user: CurrentUser, plant: CurrentPlant,
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
+):
+    """
+    Total Time = n_shifts × shift_hours × n_days_in_bucket.
+    Deterministik — tidak bergantung pada ada/tidaknya data transaksi.
+    all_line = Σ total_time semua line (non-merged-member).
+    """
+    data = _run(plant, date_from, date_to, group_by, line_ids)
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {"name": d["name"], "total_h": d["total_h"]}
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": r["all_line"]["total_h"],
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
+
+
+# ─── Loading Time ─────────────────────────────────────────────────────────────
 
 @router.get("/loading-time")
 def get_loading_time(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """Loading Time = Total Time − Σ Scheduled Downtime"""
+    """
+    Loading Time = Total Time - Σ Scheduled Downtime.
+    sched_breakdown: detail per (l1, l2, l3).
+    all_line = Σ loading_time semua line (non-merged-member).
+    """
     data = _run(plant, date_from, date_to, group_by, line_ids)
-    return {"data": [
-        {"date": r["date"],
-         "lines": {lid: {k: d[k] for k in ("name","total_h","sched_loss_h","loading_h")}
-                   for lid, d in r["lines"].items()},
-         "all_line": r["all_line"]["loading_h"]}
-        for r in data
-    ], **_meta(date_from, date_to, group_by)}
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {
+                        "name":            d["name"],
+                        "total_h":         d["total_h"],
+                        "sched_loss_h":    d["sched_loss_h"],
+                        "loading_h":       d["loading_h"],
+                        "sched_breakdown": d["sched_breakdown"],
+                    }
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": {
+                    "total_h":         r["all_line"]["total_h"],
+                    "sched_loss_h":    r["all_line"]["sched_loss_h"],
+                    "loading_h":       r["all_line"]["loading_h"],
+                    "sched_breakdown": r["all_line"]["sched_breakdown"],
+                },
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
 
+
+# ─── Operating Time ───────────────────────────────────────────────────────────
 
 @router.get("/operating-time")
 def get_operating_time(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """Operating Time = Loading Time − Σ Operating Losses"""
+    """
+    Operating Time = Loading Time - Σ Operating Losses (non-scheduled downtime).
+    op_breakdown: detail per (l1, l2, l3).
+    all_line = Σ operating_time semua line (non-merged-member).
+    """
     data = _run(plant, date_from, date_to, group_by, line_ids)
-    return {"data": [
-        {"date": r["date"],
-         "lines": {lid: {k: d[k] for k in ("name","loading_h","op_loss_h","operating_h")}
-                   for lid, d in r["lines"].items()},
-         "all_line": r["all_line"]["operating_h"]}
-        for r in data
-    ], **_meta(date_from, date_to, group_by)}
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {
+                        "name":         d["name"],
+                        "loading_h":    d["loading_h"],
+                        "op_loss_h":    d["op_loss_h"],
+                        "operating_h":  d["operating_h"],
+                        "op_breakdown": d["op_breakdown"],
+                    }
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": {
+                    "loading_h":    r["all_line"]["loading_h"],
+                    "op_loss_h":    r["all_line"]["op_loss_h"],
+                    "operating_h":  r["all_line"]["operating_h"],
+                    "op_breakdown": r["all_line"]["op_breakdown"],
+                },
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
 
+
+# ─── Availability ─────────────────────────────────────────────────────────────
 
 @router.get("/availability-rate")
 def get_availability_rate(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """Availability = Operating Time / Loading Time × 100%"""
+    """Availability = Operating Time / Loading Time × 100."""
     data = _run(plant, date_from, date_to, group_by, line_ids)
-    return {"data": [
-        {"date": r["date"],
-         "lines": {lid: {**{k: d[k] for k in ("name","loading_h","operating_h","total_h","sched_loss_h","op_loss_h")},
-                         "rate": d["availability"]}
-                   for lid, d in r["lines"].items()},
-         "all_line": r["all_line"]["availability"]}
-        for r in data
-    ], **_meta(date_from, date_to, group_by)}
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {
+                        "name":            d["name"],
+                        "total_h":         d["total_h"],
+                        "sched_loss_h":    d["sched_loss_h"],
+                        "op_loss_h":       d["op_loss_h"],
+                        "loading_h":       d["loading_h"],
+                        "operating_h":     d["operating_h"],
+                        "availability":    d["availability"],
+                        "sched_breakdown": d["sched_breakdown"],
+                        "op_breakdown":    d["op_breakdown"],
+                    }
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": {
+                    "loading_h":    r["all_line"]["loading_h"],
+                    "operating_h":  r["all_line"]["operating_h"],
+                    "availability": r["all_line"]["availability"],
+                },
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
 
+
+# ─── Performance ──────────────────────────────────────────────────────────────
 
 @router.get("/performance-rate")
 def get_performance_rate(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """Performance = Actual Throughput / Std Throughput × 100%"""
+    """Performance = Actual Throughput / Std Throughput × 100."""
     data = _run(plant, date_from, date_to, group_by, line_ids)
-    return {"data": [
-        {"date": r["date"],
-         "lines": {lid: {k: d[k] for k in ("name","operating_h","actual_output",
-                                             "actual_throughput","std_throughput","performance")}
-                   for lid, d in r["lines"].items()},
-         "all_line": {k: r["all_line"][k] for k in ("actual_output","performance")}}
-        for r in data
-    ], **_meta(date_from, date_to, group_by)}
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {
+                        "name":              d["name"],
+                        "operating_h":       d["operating_h"],
+                        "actual_output":     d["actual_output"],
+                        "actual_throughput": d["actual_throughput"],
+                        "std_throughput":    d["std_throughput"],
+                        "performance":       d["performance"],
+                    }
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": {
+                    "actual_output": r["all_line"]["actual_output"],
+                    "performance":   r["all_line"]["performance"],
+                },
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
 
+
+# ─── Quality ──────────────────────────────────────────────────────────────────
 
 @router.get("/quality-rate")
 def get_quality_rate(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """Quality = Good Product / Total Output × 100%"""
+    """Quality = Good Product / Total Output × 100."""
     data = _run(plant, date_from, date_to, group_by, line_ids)
-    return {"data": [
-        {"date": r["date"],
-         "lines": {lid: {k: d[k] for k in ("name","actual_output","good_product","quality")}
-                   for lid, d in r["lines"].items()},
-         "all_line": {k: r["all_line"][k] for k in ("actual_output","good_product","quality")}}
-        for r in data
-    ], **_meta(date_from, date_to, group_by)}
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {
+                        "name":         d["name"],
+                        "actual_output": d["actual_output"],
+                        "good_product": d["good_product"],
+                        "quality":      d["quality"],
+                    }
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": {
+                    "actual_output": r["all_line"]["actual_output"],
+                    "good_product":  r["all_line"]["good_product"],
+                    "quality":       r["all_line"]["quality"],
+                },
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
 
+
+# ─── OEE ──────────────────────────────────────────────────────────────────────
 
 @router.get("/oee")
 def get_oee(
     current_user: CurrentUser, plant: CurrentPlant,
-    date_from: date = Query(...), date_to: date = Query(...),
-    group_by: str = Query("daily"), line_ids: Optional[str] = Query(None),
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+    group_by:  str  = Query("daily"),
+    line_ids:  Optional[str] = Query(None),
 ):
-    """OEE = Availability × Performance × Quality / 10000"""
+    """OEE = Availability × Performance × Quality / 10000."""
     data = _run(plant, date_from, date_to, group_by, line_ids)
-    return {"data": [
-        {"date": r["date"],
-         "lines": {lid: {k: d[k] for k in ("name","availability","performance","quality","oee")}
-                   for lid, d in r["lines"].items()},
-         "all_line": {k: r["all_line"][k] for k in ("availability","performance","quality","oee")}}
-        for r in data
-    ], **_meta(date_from, date_to, group_by)}
+    return {
+        "data": [
+            {
+                "date": r["date"],
+                "lines": {
+                    str(lid): {
+                        "name":         d["name"],
+                        "availability": d["availability"],
+                        "performance":  d["performance"],
+                        "quality":      d["quality"],
+                        "oee":          d["oee"],
+                    }
+                    for lid, d in r["lines"].items()
+                },
+                "all_line": {
+                    "availability": r["all_line"]["availability"],
+                    "performance":  r["all_line"]["performance"],
+                    "quality":      r["all_line"]["quality"],
+                    "oee":          r["all_line"]["oee"],
+                },
+            }
+            for r in data
+        ],
+        **_meta(date_from, date_to, group_by),
+    }
+
+
+# ─── DEBUG — hapus setelah verifikasi ─────────────────────────────────────────
+
+@router.get("/debug-raw")
+def debug_raw(
+    current_user: CurrentUser, plant: CurrentPlant,
+    date_from: date = Query(...),
+    date_to:   date = Query(...),
+):
+    """
+    Kembalikan raw data dari DB: shifts, lines, losses, productions.
+    Untuk verifikasi apakah data sudah masuk dengan benar.
+    """
+    from datetime import datetime
+    from app.models.plant_schema import (
+        MasterShift, MasterLine, MachineLossInput,
+        MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
+        ProductionOutput, MasterOutputType,
+    )
+    dt_from = datetime.combine(date_from, datetime.min.time())
+    dt_to   = datetime.combine(date_to,   datetime.max.time())
+
+    db = next(get_plant_db(plant.schema_name))
+    try:
+        shifts = db.query(MasterShift).filter(MasterShift.is_active == True).all()
+        lines  = db.query(MasterLine).filter(MasterLine.is_active == True).all()
+
+        loss_rows = (
+            db.query(
+                MachineLossInput.id,
+                MachineLossInput.line_id,
+                MachineLossInput.date,
+                MachineLossInput.duration_minutes,
+                MachineLossLvl1.name.label("l1"),
+                MachineLossLvl2.name.label("l2"),
+                MachineLossLvl3.name.label("l3"),
+            )
+            .outerjoin(MachineLossLvl1, MachineLossInput.loss_l1_id == MachineLossLvl1.machine_losses_lvl_1_id)
+            .outerjoin(MachineLossLvl2, MachineLossInput.loss_l2_id == MachineLossLvl2.machine_losses_lvl_2_id)
+            .outerjoin(MachineLossLvl3, MachineLossInput.loss_l3_id == MachineLossLvl3.machine_losses_lvl_3_id)
+            .filter(
+                MachineLossInput.is_active == True,
+                MachineLossInput.date.between(dt_from, dt_to),
+            )
+            .all()
+        )
+
+        prod_rows = (
+            db.query(
+                ProductionOutput.id,
+                ProductionOutput.line_id,
+                ProductionOutput.date,
+                ProductionOutput.output_type,
+                ProductionOutput.quantity,
+                MasterOutputType.is_good_product,
+            )
+            .join(MasterOutputType, ProductionOutput.output_type == MasterOutputType.code)
+            .filter(
+                ProductionOutput.is_active == True,
+                ProductionOutput.date.between(dt_from, dt_to),
+            )
+            .all()
+        )
+
+        return {
+            "shifts": [
+                {
+                    "id": s.id, "name": s.name,
+                    "time_from": str(s.time_from), "time_to": str(s.time_to),
+                    "hours_actual": round(((s.time_to.hour*60+s.time_to.minute) - (s.time_from.hour*60+s.time_from.minute)) % 1440 / 60, 4)
+                }
+                for s in shifts
+            ],
+            "n_shifts_active": len(shifts),
+            "total_time_per_line_per_day_formula": f"{len(shifts)} shifts × 8h = {len(shifts)*8}h",
+            "lines": [{"id": l.id, "name": l.name} for l in lines],
+            "total_shift_hours_per_day": round(
+                sum(
+                    ((s.time_to.hour*60+s.time_to.minute) - (s.time_from.hour*60+s.time_from.minute)) % 1440 / 60
+                    for s in shifts
+                ), 4
+            ),
+            "losses_count": len(loss_rows),
+            "losses": [
+                {
+                    "id": r.id, "line_id": r.line_id,
+                    "date": str(r.date), "duration_min": r.duration_minutes,
+                    "l1": r.l1, "l2": r.l2, "l3": r.l3,
+                }
+                for r in loss_rows
+            ],
+            "productions_count": len(prod_rows),
+            "productions": [
+                {
+                    "id": r.id, "line_id": r.line_id,
+                    "date": str(r.date), "output_type": r.output_type,
+                    "quantity": r.quantity, "is_good_product": r.is_good_product,
+                }
+                for r in prod_rows
+            ],
+        }
+    finally:
+        db.close()

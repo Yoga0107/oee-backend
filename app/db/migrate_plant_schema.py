@@ -234,7 +234,30 @@ def migrate_plant_schema(schema_name: str) -> None:
                 conn.rollback()
         print(f"  ✅ master_standard_throughputs OK ({s})")
 
-        # ── 9. production_outputs ────────────────────────────────────────────
+        # ── 8b. standard_throughput_logs ─────────────────────────────────────
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{s}".standard_throughput_logs (
+                id                      SERIAL PRIMARY KEY,
+                standard_throughput_id  INTEGER NOT NULL
+                                          REFERENCES "{s}".master_standard_throughputs(id) ON DELETE CASCADE,
+                change_number           INTEGER NOT NULL,
+                old_throughput          INTEGER,
+                new_throughput          INTEGER NOT NULL,
+                old_remarks             VARCHAR(500),
+                new_remarks             VARCHAR(500),
+                reason                  VARCHAR(1000),
+                changed_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                changed_by_id           INTEGER
+            )
+        """))
+        conn.execute(text(f"""
+            ALTER TABLE "{s}".master_standard_throughputs
+            ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
+        """))
+        conn.commit()
+        print(f"  ✅ standard_throughput_logs OK ({s})")
+
+
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS "{s}".production_outputs (
                 id               SERIAL PRIMARY KEY,

@@ -17,7 +17,7 @@ from app.models.public import Plant
 from app.models.plant_schema import (
     MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
     MasterMachineLoss,
-    MasterShift, MasterFeedCode, MasterLine, MasterStandardThroughput,
+    MasterShift, MasterFeedCode, MasterLine, MasterStandardThroughput, StandardThroughputLog,
     MergedLine, MergedLineDetail,
     MasterOutputType, DEFAULT_OUTPUT_TYPES,
 )
@@ -29,7 +29,7 @@ from app.schemas.master import (
     ShiftCreate, ShiftUpdate, ShiftResponse,
     FeedCodeCreate, FeedCodeUpdate, FeedCodeResponse,
     LineCreate, LineUpdate, LineResponse,
-    StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse,
+    StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse, StandardThroughputLogResponse,
     MergedLineCreate, MergedLineUpdate, MergedLineResponse, MergedLineMemberResponse,
     OutputTypeCreate, OutputTypeUpdate, OutputTypeResponse,
 )
@@ -396,12 +396,18 @@ def delete_line(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
 @router.get("/standard-throughputs", response_model=list[StandardThroughputResponse])
 def get_standard_throughputs(current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    return db.query(MasterStandardThroughput).order_by(MasterStandardThroughput.id).all()
+    return db.query(MasterStandardThroughput).filter(MasterStandardThroughput.is_active == True).order_by(MasterStandardThroughput.id).all()
 
 
 @router.post("/standard-throughputs", response_model=StandardThroughputResponse, status_code=201)
 def create_standard_throughput(payload: StandardThroughputCreate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
+    dup = db.query(MasterStandardThroughput).filter(
+        MasterStandardThroughput.line_id == payload.line_id,
+        MasterStandardThroughput.feed_code_id == payload.feed_code_id,
+        MasterStandardThroughput.is_active == True,
+    ).first()
+    if dup: raise HTTPException(400, "Kombinasi Line dan Kode Pakan ini sudah ada.")
     item = MasterStandardThroughput(**payload.model_dump(), created_by_id=current_user.id)
     db.add(item); db.commit(); db.refresh(item)
     return item
@@ -410,19 +416,50 @@ def create_standard_throughput(payload: StandardThroughputCreate, current_user: 
 @router.put("/standard-throughputs/{item_id}", response_model=StandardThroughputResponse)
 def update_standard_throughput(item_id: int, payload: StandardThroughputUpdate, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id).first()
+    item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id, MasterStandardThroughput.is_active == True).first()
     if not item: raise HTTPException(404, "Standard throughput not found")
-    for k, v in payload.model_dump(exclude_none=True).items(): setattr(item, k, v)
+    new_line_id = payload.line_id if payload.line_id is not None else item.line_id
+    new_feed_code_id = payload.feed_code_id if payload.feed_code_id is not None else item.feed_code_id
+    dup = db.query(MasterStandardThroughput).filter(
+        MasterStandardThroughput.line_id == new_line_id,
+        MasterStandardThroughput.feed_code_id == new_feed_code_id,
+        MasterStandardThroughput.is_active == True,
+        MasterStandardThroughput.id != item_id,
+    ).first()
+    if dup: raise HTTPException(400, "Kombinasi Line dan Kode Pakan ini sudah ada.")
+    count = db.query(StandardThroughputLog).filter(StandardThroughputLog.standard_throughput_id == item_id).count()
+    log = StandardThroughputLog(
+        standard_throughput_id=item_id,
+        change_number=count + 1,
+        old_throughput=item.standard_throughput,
+        new_throughput=payload.standard_throughput if payload.standard_throughput is not None else item.standard_throughput,
+        old_remarks=item.remarks,
+        new_remarks=payload.remarks if payload.remarks is not None else item.remarks,
+        reason=payload.reason,
+        changed_by_id=current_user.id,
+    )
+    db.add(log)
+    update_data = payload.model_dump(exclude_none=True)
+    update_data.pop("reason", None)
+    for k, v in update_data.items(): setattr(item, k, v)
     item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
     return item
+
+
+@router.get("/standard-throughputs/{item_id}/logs", response_model=list[StandardThroughputLogResponse])
+def get_standard_throughput_logs(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    db = _db(plant)
+    item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id).first()
+    if not item: raise HTTPException(404, "Standard throughput not found")
+    return db.query(StandardThroughputLog).filter(StandardThroughputLog.standard_throughput_id == item_id).order_by(StandardThroughputLog.id).all()
 
 
 @router.delete("/standard-throughputs/{item_id}", status_code=204)
 def delete_standard_throughput(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
     db = _db(plant)
-    item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id).first()
+    item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id, MasterStandardThroughput.is_active == True).first()
     if not item: raise HTTPException(404, "Standard throughput not found")
-    db.delete(item); db.commit()
+    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
 
 
 # ════════════════════════════════════════════════════════

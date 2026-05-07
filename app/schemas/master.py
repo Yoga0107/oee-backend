@@ -172,8 +172,25 @@ class StandardThroughputCreate(StandardThroughputBase):
 
 
 class StandardThroughputUpdate(BaseModel):
+    line_id: Optional[int] = None
+    feed_code_id: Optional[int] = None
     standard_throughput: Optional[int] = None
     remarks: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class StandardThroughputLogResponse(BaseModel):
+    id: int
+    standard_throughput_id: int
+    change_number: int
+    old_throughput: Optional[int]
+    new_throughput: int
+    old_remarks: Optional[str]
+    new_remarks: Optional[str]
+    reason: Optional[str]
+    changed_at: datetime
+    changed_by_id: Optional[int]
+    model_config = {"from_attributes": True}
 
 
 class StandardThroughputResponse(StandardThroughputBase):
