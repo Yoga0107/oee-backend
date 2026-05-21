@@ -1,0 +1,18 @@
+# ============================================================
+# requirements-ai.txt — Phase 2
+# Tambahkan ke requirements.txt yang sudah ada
+# ============================================================
+
+# LangChain core
+langchain>=0.3.0
+langchain-core>=0.3.0
+
+# Provider packages
+langchain-ollama>=0.2.0          # Ollama (local)
+langchain-groq>=0.2.0            # Groq (free cloud)
+langchain-openai>=0.2.0          # OpenAI + OpenRouter (OpenAI-compat)
+langchain-anthropic>=0.3.0       # Claude
+langchain-google-genai>=2.0.0    # Gemini
+
+# Async PostgreSQL driver
+asyncpg>=0.29.0

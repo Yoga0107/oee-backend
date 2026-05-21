@@ -11,17 +11,30 @@ from app.core.exceptions import (
     integrity_error_handler,
     generic_exception_handler,
 )
+from app.api.ai.chat import router as ai_chat_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup: jalankan migrasi semua plant schema ───────────────────────
     print(f"🚀  {settings.APP_NAME} v{settings.APP_VERSION} started")
+
+    # ── Migrasi plant schema (sudah ada sebelumnya) ────────────────────────
     try:
         from app.db.migrate_plant_schema import run_all_migrations
         run_all_migrations()
     except Exception as e:
         print(f"⚠️  Migration warning (non-fatal): {e}")
+
+    # ── NEW: Buat tabel AI jika belum ada ─────────────────────────────────
+    try:
+        from app.db.database import engine, Base
+        # Import model agar Base tahu tabel apa yang harus dibuat
+        from app.models.ai_models import Conversation, Message, ProviderLog, TokenUsage
+        Base.metadata.create_all(bind=engine)
+        print("✅  AI tables ready")
+    except Exception as e:
+        print(f"⚠️  AI table creation warning: {e}")
+
     yield
     print("👋  Server shutting down")
 
@@ -48,9 +61,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000",
-                   "http://localhost:3001",
-        "https://dp-enterprise.vercel.app",],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "https://dp-enterprise.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,6 +76,7 @@ app.add_exception_handler(IntegrityError, integrity_error_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
 
 app.include_router(api_router)
+app.include_router(ai_chat_router)
 
 
 @app.get("/", tags=["Health"])
