@@ -8,12 +8,14 @@ Machine Loss data flow (new 4-table ERD):
   master_machine_losses        — katalog kombinasi (FK → l1, l2, l3)
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy.orm import Session
+from typing import Optional
+from datetime import datetime
 
-from app.db.database import get_plant_db
+from app.db.database import get_plant_db, get_db
 from app.core.deps import CurrentUser, CurrentPlant
-from app.models.public import Plant
+from app.models.public import Plant, User
 from app.models.plant_schema import (
     MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
     MasterMachineLoss,
@@ -29,7 +31,8 @@ from app.schemas.master import (
     ShiftCreate, ShiftUpdate, ShiftResponse,
     FeedCodeCreate, FeedCodeUpdate, FeedCodeResponse,
     LineCreate, LineUpdate, LineResponse,
-    StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse, StandardThroughputLogResponse,
+    StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse,
+    StandardThroughputLogResponse,
     MergedLineCreate, MergedLineUpdate, MergedLineResponse, MergedLineMemberResponse,
     OutputTypeCreate, OutputTypeUpdate, OutputTypeResponse,
 )
@@ -418,31 +421,32 @@ def update_standard_throughput(item_id: int, payload: StandardThroughputUpdate, 
     db = _db(plant)
     item = db.query(MasterStandardThroughput).filter(MasterStandardThroughput.id == item_id, MasterStandardThroughput.is_active == True).first()
     if not item: raise HTTPException(404, "Standard throughput not found")
-    new_line_id = payload.line_id if payload.line_id is not None else item.line_id
+    new_line_id      = payload.line_id      if payload.line_id      is not None else item.line_id
     new_feed_code_id = payload.feed_code_id if payload.feed_code_id is not None else item.feed_code_id
     dup = db.query(MasterStandardThroughput).filter(
-        MasterStandardThroughput.line_id == new_line_id,
+        MasterStandardThroughput.line_id      == new_line_id,
         MasterStandardThroughput.feed_code_id == new_feed_code_id,
-        MasterStandardThroughput.is_active == True,
-        MasterStandardThroughput.id != item_id,
+        MasterStandardThroughput.is_active    == True,
+        MasterStandardThroughput.id           != item_id,
     ).first()
     if dup: raise HTTPException(400, "Kombinasi Line dan Kode Pakan ini sudah ada.")
     count = db.query(StandardThroughputLog).filter(StandardThroughputLog.standard_throughput_id == item_id).count()
-    log = StandardThroughputLog(
-        standard_throughput_id=item_id,
-        change_number=count + 1,
-        old_throughput=item.standard_throughput,
-        new_throughput=payload.standard_throughput if payload.standard_throughput is not None else item.standard_throughput,
-        old_remarks=item.remarks,
-        new_remarks=payload.remarks if payload.remarks is not None else item.remarks,
-        reason=payload.reason,
-        changed_by_id=current_user.id,
+    log   = StandardThroughputLog(
+        standard_throughput_id = item_id,
+        change_number          = count + 1,
+        old_throughput         = item.standard_throughput,
+        new_throughput         = payload.standard_throughput if payload.standard_throughput is not None else item.standard_throughput,
+        old_remarks            = item.remarks,
+        new_remarks            = payload.remarks if payload.remarks is not None else item.remarks,
+        reason                 = payload.reason,
+        changed_by_id          = current_user.id,
     )
     db.add(log)
     update_data = payload.model_dump(exclude_none=True)
     update_data.pop("reason", None)
     for k, v in update_data.items(): setattr(item, k, v)
-    item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
+    item.updated_by_id = current_user.id
+    db.commit(); db.refresh(item)
     return item
 
 
@@ -469,7 +473,9 @@ def delete_standard_throughput(item_id: int, current_user: CurrentUser, plant: C
 def _build_merged_response(ml: MergedLine) -> dict:
     return {
         "id": ml.id, "name": ml.name, "code": ml.code, "remarks": ml.remarks,
-        "is_active": ml.is_active, "created_at": ml.created_at, "created_by_id": ml.created_by_id,
+        "is_active": ml.is_active,
+        "created_at": ml.created_at, "created_by_id": ml.created_by_id,
+        "updated_at": ml.updated_at, "updated_by_id": ml.updated_by_id,
         "members": [{"line_id": d.line_id, "line_name": d.line.name, "line_code": d.line.code} for d in ml.details],
     }
 
@@ -600,3 +606,140 @@ def delete_output_type(item_id: int, current_user: CurrentUser, plant: CurrentPl
     item.is_active = False
     item.updated_by_id = current_user.id
     db.commit()
+
+
+# ════════════════════════════════════════════════════════
+# MASTER CHANGELOG
+# ════════════════════════════════════════════════════════
+
+def _user_map(public_db) -> dict[int, str]:
+    users = public_db.query(User.id, User.full_name, User.username).all()
+    return {u.id: (u.full_name or u.username) for u in users}
+
+
+def _determine_action(is_active: bool, created_at, updated_at, created_by_id, updated_by_id):
+    if not is_active:
+        return "delete", updated_at, updated_by_id
+    if updated_by_id is None or created_at == updated_at:
+        return "create", created_at, created_by_id
+    return "update", updated_at, updated_by_id
+
+
+def _collect_changelog(db) -> list[dict]:
+    rows: list[dict] = []
+
+    for s in db.query(MasterShift).all():
+        action, ts, uid = _determine_action(s.is_active, s.created_at, s.updated_at, s.created_by_id, s.updated_by_id)
+        rows.append({"master": "Master Shift", "record_id": s.id, "label": s.name,
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"name": s.name, "time_from": str(s.time_from), "time_to": str(s.time_to), "is_active": s.is_active}})
+
+    for f in db.query(MasterFeedCode).all():
+        action, ts, uid = _determine_action(f.is_active, f.created_at, f.updated_at, f.created_by_id, f.updated_by_id)
+        rows.append({"master": "Master Feed Code", "record_id": f.id, "label": f.code,
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"code": f.code, "remarks": f.remarks, "is_active": f.is_active}})
+
+    for l in db.query(MasterLine).all():
+        action, ts, uid = _determine_action(l.is_active, l.created_at, l.updated_at, l.created_by_id, l.updated_by_id)
+        rows.append({"master": "Master Line", "record_id": l.id, "label": l.name,
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"name": l.name, "code": l.code, "remarks": l.remarks, "is_active": l.is_active}})
+
+    for t in db.query(MasterStandardThroughput).all():
+        action, ts, uid = _determine_action(t.is_active, t.created_at, t.updated_at, t.created_by_id, t.updated_by_id)
+        rows.append({"master": "Standard Throughput", "record_id": t.id,
+                     "label": f"Line #{t.line_id} / Feed #{t.feed_code_id}",
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"line_id": t.line_id, "feed_code_id": t.feed_code_id,
+                                "standard_throughput": t.standard_throughput, "remarks": t.remarks, "is_active": t.is_active}})
+
+    for o in db.query(MasterOutputType).all():
+        action, ts, uid = _determine_action(o.is_active, o.created_at, o.updated_at, o.created_by_id, o.updated_by_id)
+        rows.append({"master": "Master Output Type", "record_id": o.id, "label": o.name,
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"code": o.code, "name": o.name, "category": o.category,
+                                "is_good_product": o.is_good_product, "sort_order": o.sort_order,
+                                "remarks": o.remarks, "is_active": o.is_active}})
+
+    for m in db.query(MasterMachineLoss).all():
+        action, ts, uid = _determine_action(m.is_active, m.created_at, m.updated_at, m.created_by_id, m.updated_by_id)
+        l1 = m.lvl1.name if m.lvl1 else None
+        l2 = m.lvl2.name if m.lvl2 else None
+        l3 = m.lvl3.name if m.lvl3 else None
+        label = " › ".join(filter(None, [l1, l2, l3])) or f"Loss #{m.machine_losses_id}"
+        rows.append({"master": "Master Machine Loss", "record_id": m.machine_losses_id, "label": label,
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"l1": l1, "l2": l2, "l3": l3, "remarks": m.remarks, "is_active": m.is_active}})
+
+    for ml in db.query(MergedLine).all():
+        action, ts, uid = _determine_action(ml.is_active, ml.created_at, ml.updated_at, ml.created_by_id, ml.updated_by_id)
+        rows.append({"master": "Merged Line", "record_id": ml.id, "label": ml.name,
+                     "action": action, "changed_at": ts, "changed_by_id": uid,
+                     "detail": {"name": ml.name, "code": ml.code, "remarks": ml.remarks, "is_active": ml.is_active}})
+
+    for l1 in db.query(MachineLossLvl1).all():
+        rows.append({"master": "Machine Loss L1", "record_id": l1.machine_losses_lvl_1_id, "label": l1.name,
+                     "action": "create", "changed_at": None, "changed_by_id": None,
+                     "detail": {"name": l1.name}})
+
+    for l2 in db.query(MachineLossLvl2).all():
+        rows.append({"master": "Machine Loss L2", "record_id": l2.machine_losses_lvl_2_id, "label": l2.name,
+                     "action": "create", "changed_at": None, "changed_by_id": None,
+                     "detail": {"name": l2.name}})
+
+    for l3 in db.query(MachineLossLvl3).all():
+        rows.append({"master": "Machine Loss L3", "record_id": l3.machine_losses_lvl_3_id, "label": l3.name,
+                     "action": "create", "changed_at": None, "changed_by_id": None,
+                     "detail": {"name": l3.name}})
+
+    return rows
+
+
+@router.get("/changelog")
+def get_master_changelog(
+    current_user: CurrentUser,
+    plant:        CurrentPlant,
+    page:         int           = Query(1, ge=1),
+    per_page:     int           = Query(20, ge=1, le=100),
+    master:       Optional[str] = Query(None),
+    action:       Optional[str] = Query(None),
+    search:       Optional[str] = Query(None),
+    order:        str           = Query("desc"),
+):
+    plant_db  = _db(plant)
+    public_db = next(get_db())
+    try:
+        um   = _user_map(public_db)
+        rows = _collect_changelog(plant_db)
+    finally:
+        public_db.close()
+
+    for r in rows:
+        uid = r["changed_by_id"]
+        r["changed_by"] = um.get(uid, f"User #{uid}") if uid else None
+
+    if master: rows = [r for r in rows if r["master"] == master]
+    if action: rows = [r for r in rows if r["action"] == action]
+    if search:
+        q = search.lower()
+        rows = [r for r in rows if q in (r["label"] or "").lower()]
+
+    rows.sort(key=lambda r: (r["changed_at"] is None, r["changed_at"] or datetime.min), reverse=(order == "desc"))
+
+    all_masters = sorted({r["master"] for r in rows})
+    total       = len(rows)
+    paged       = rows[(page - 1) * per_page : page * per_page]
+
+    for r in paged:
+        if r["changed_at"]:
+            r["changed_at"] = r["changed_at"].isoformat()
+
+    return {
+        "data":        paged,
+        "total":       total,
+        "page":        page,
+        "per_page":    per_page,
+        "total_pages": (total + per_page - 1) // per_page,
+        "masters":     all_masters,
+    }
