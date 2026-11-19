@@ -38,5 +38,5 @@ def decode_token(token: str) -> Optional[dict]:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         return payload
     except JWTError as e:
-        print(f"JWT Decode Error: {e}") # Ini yang tadi memunculkan pesan "Subject must be a string"
+        print(f"JWT Decode Error: {e}")
         return None
