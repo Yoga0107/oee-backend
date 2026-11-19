@@ -6,7 +6,8 @@ from app.models.plant_schema import (
     MachineLossInput, MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
     MasterLine, MasterShift,
     MasterStandardThroughput, MasterFeedCode,
-    MergedLine, ProductionOutput, MasterOutputType,
+    IntLineMerge, LINE_TYPE_MERGED,
+    ProductionOutput, MasterOutputType,
 )
 from app.oee.formulas import compute_oee_metrics, SCHEDULED_L1, NON_OPERATING_L1s
 
@@ -40,11 +41,21 @@ def compute_time_metrics(
     shifts_data = [{"id": s.id, "name": s.name, "time_from": s.time_from, "time_to": s.time_to} for s in shifts]
 
     # ── 3. Merged lines ───────────────────────────────────────────────────────
-    merged_lines_raw = db.query(MergedLine).filter(MergedLine.is_active == True).all()
+    # Ambil semua merged lines (MasterLine dengan type='merged') yang aktif
+    merged_lines_raw = (
+        db.query(MasterLine)
+        .filter(MasterLine.type == LINE_TYPE_MERGED, MasterLine.is_active == True)
+        .all()
+    )
     merged_lines_data: list[dict] = []
     line_id_set = set(line_id_list)
     for ml in merged_lines_raw:
-        member_ids = [d.line_id for d in ml.details if d.line_id in line_id_set]
+        # Ambil child_line_id dari IntLineMerge via relasi child_merges
+        member_ids = [
+            merge.child_line_id
+            for merge in ml.child_merges
+            if merge.child_line_id in line_id_set
+        ]
         if len(member_ids) >= 2:
             member_names = [l.name for l in lines if l.id in set(member_ids)]
             merged_lines_data.append({"name": " & ".join(member_names), "member_ids": member_ids})

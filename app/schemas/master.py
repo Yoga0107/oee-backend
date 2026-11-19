@@ -1,5 +1,5 @@
 from pydantic import BaseModel, field_validator
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime, time
 
 
@@ -133,6 +133,9 @@ class FeedCodeResponse(FeedCodeBase):
 
 
 # ─── Line ─────────────────────────────────────────────────────────────────────
+# MODIFIKASI: LineCreate sekarang tidak lagi digunakan untuk membuat merged line.
+# Untuk line fisik, gunakan LineCreate (type default = 'physical').
+# Untuk merged line, gunakan MergedLineCreate yang akan otomatis set type = 'merged'.
 class LineBase(BaseModel):
     name: str
     code: Optional[str] = None
@@ -140,7 +143,7 @@ class LineBase(BaseModel):
 
 
 class LineCreate(LineBase):
-    pass
+    pass  # type selalu 'physical', diset di endpoint
 
 
 class LineUpdate(BaseModel):
@@ -153,6 +156,7 @@ class LineUpdate(BaseModel):
 class LineResponse(LineBase):
     id: int
     plant_id: int
+    type: str  # 'physical' | 'merged'
     is_active: bool
     created_at: datetime
     created_by_id: Optional[int]
@@ -217,38 +221,78 @@ class PlantResponse(BaseModel):
     created_at: datetime
     model_config = {"from_attributes": True}
 
-# ─── Merged Line ──────────────────────────────────────────────────────────────
+
+# ─── Merged Line (via IntLineMerge) ──────────────────────────────────────────
+# MODIFIKASI: MergedLine tidak lagi tabel terpisah.
+# Merged line = MasterLine dengan type='merged' + relasi di int_line_merge.
+# child_line_ids boleh berisi ID dari line fisik (type='physical') MAUPUN
+# line hasil merge (type='merged') → mendukung penggabungan bertingkat.
+#
+# Contoh:
+#   LineA (physical) + LineB (physical) → LINE_AB (merged)
+#   LineC (physical) + LineD (physical) → LINE_CD (merged)
+#   LINE_AB (merged) + LINE_CD (merged) → LINE_ABCD (merged)  ← bertingkat!
+
 class MergedLineCreate(BaseModel):
     name: str
     code: Optional[str] = None
     remarks: Optional[str] = None
-    line_ids: list[int]  # minimal 2 line
+    child_line_ids: list[int]  # minimal 2; boleh mix physical & merged line
+
+    @field_validator("child_line_ids")
+    @classmethod
+    def validate_min_children(cls, v: list[int]) -> list[int]:
+        if len(v) < 2:
+            raise ValueError("Minimal 2 line harus dipilih")
+        if len(v) != len(set(v)):
+            raise ValueError("child_line_ids tidak boleh duplikat")
+        return v
 
 
 class MergedLineUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     remarks: Optional[str] = None
-    line_ids: Optional[list[int]] = None  # jika dikirim, replace seluruh detail
+    child_line_ids: Optional[list[int]] = None  # jika dikirim, replace seluruh relasi
     is_active: Optional[bool] = None
 
+    @field_validator("child_line_ids")
+    @classmethod
+    def validate_min_children(cls, v: Optional[list[int]]) -> Optional[list[int]]:
+        if v is not None:
+            if len(v) < 2:
+                raise ValueError("Minimal 2 line harus dipilih")
+            if len(v) != len(set(v)):
+                raise ValueError("child_line_ids tidak boleh duplikat")
+        return v
 
-class MergedLineMemberResponse(BaseModel):
-    line_id: int
+
+class MergedChildResponse(BaseModel):
+    """Representasi satu child line di dalam merged line."""
+    line_id:   int
     line_name: str
     line_code: Optional[str] = None
+    line_type: str  # 'physical' | 'merged' — membantu FE menampilkan hierarki
     model_config = {"from_attributes": True}
 
 
 class MergedLineResponse(BaseModel):
-    id: int
-    name: str
-    code: Optional[str] = None
-    remarks: Optional[str] = None
-    is_active: bool
-    created_at: datetime
-    created_by_id: Optional[int] = None
-    members: list[MergedLineMemberResponse] = []
+    """
+    Response untuk merged line (MasterLine dengan type='merged').
+    Field `children` berisi daftar langsung child-nya saja (bukan rekursif),
+    sehingga FE bisa membangun pohon secara mandiri.
+    """
+    id:             int
+    name:           str
+    code:           Optional[str] = None
+    remarks:        Optional[str] = None
+    type:           str  # selalu 'merged'
+    is_active:      bool
+    created_at:     datetime
+    created_by_id:  Optional[int] = None
+    updated_at:     Optional[datetime] = None
+    updated_by_id:  Optional[int] = None
+    children:       list[MergedChildResponse] = []
     model_config = {"from_attributes": True}
 
 

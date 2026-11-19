@@ -447,3 +447,146 @@ def run_all_migrations():
 
 if __name__ == "__main__":
     run_all_migrations()
+
+"""
+MIGRASI DATABASE: int_line_merge
+=================================
+Menggantikan tabel merged_lines + merged_line_details dengan struktur baru:
+- Kolom `type` ditambahkan ke master_lines ('physical' | 'merged')
+- Tabel baru `int_line_merge` dengan self-referential FK ke master_lines
+- Data lama dari merged_lines & merged_line_details dimigrasikan otomatis
+
+Jalankan sekali per schema (plant).
+"""
+
+# ────────────────────────────────────────────────────────────────────────────
+# A. RAW SQL (untuk referensi / manual run via psql)
+# ────────────────────────────────────────────────────────────────────────────
+
+MIGRATION_SQL = """
+-- ── 1. Tambah kolom `type` ke master_lines ──────────────────────────────────
+ALTER TABLE "{s}".master_lines
+    ADD COLUMN IF NOT EXISTS type VARCHAR(20) NOT NULL DEFAULT 'physical';
+
+-- ── 2. Buat tabel int_line_merge ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS "{s}".int_line_merge (
+    parent_line_id INTEGER NOT NULL
+                     REFERENCES "{s}".master_lines(id) ON DELETE CASCADE,
+    child_line_id  INTEGER NOT NULL
+                     REFERENCES "{s}".master_lines(id) ON DELETE CASCADE,
+    PRIMARY KEY (parent_line_id, child_line_id),
+    CONSTRAINT uq_line_merge_parent_child
+        UNIQUE (parent_line_id, child_line_id),
+    CONSTRAINT chk_no_self_merge
+        CHECK (parent_line_id <> child_line_id)
+);
+
+-- ── 3. Migrasi data dari merged_lines → master_lines (type='merged') ─────────
+INSERT INTO "{s}".master_lines (name, code, remarks, type, is_active,
+                                 created_at, created_by_id, updated_at, updated_by_id)
+SELECT  ml.name, ml.code, ml.remarks, 'merged', ml.is_active,
+        ml.created_at, ml.created_by_id, ml.updated_at, ml.updated_by_id
+FROM    "{s}".merged_lines ml
+ON CONFLICT DO NOTHING;
+
+-- ── 4. Migrasi relasi dari merged_line_details → int_line_merge ───────────────
+-- Mapping: merged_line_details.merged_line_id → master_lines.id (yang baru)
+-- Gunakan nama sebagai kunci pencocokan (asumsi nama unik per plant)
+INSERT INTO "{s}".int_line_merge (parent_line_id, child_line_id)
+SELECT  new_parent.id  AS parent_line_id,
+        mld.line_id    AS child_line_id
+FROM    "{s}".merged_line_details mld
+JOIN    "{s}".merged_lines        old_ml  ON old_ml.id   = mld.merged_line_id
+JOIN    "{s}".master_lines        new_parent
+            ON new_parent.name = old_ml.name
+           AND new_parent.type  = 'merged'
+ON CONFLICT DO NOTHING;
+
+-- ── 5. (Opsional) Drop tabel lama setelah verifikasi ─────────────────────────
+-- DROP TABLE IF EXISTS "{s}".merged_line_details;
+-- DROP TABLE IF EXISTS "{s}".merged_lines;
+"""
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# B. PYTHON — tambahkan ke migrate_plant_schema.py
+#    Ganti seksi "11. merged_lines" dan "12. merged_line_details"
+# ────────────────────────────────────────────────────────────────────────────
+
+def migrate_line_tables(conn, s: str) -> None:
+    """
+    Panggil fungsi ini di dalam loop schema pada migrate_plant_schema.py,
+    sebagai pengganti blok merged_lines (11) dan merged_line_details (12).
+    """
+
+    # ── 7b. Tambah kolom `type` ke master_lines ──────────────────────────────
+    try:
+        conn.execute(text(
+            f"ALTER TABLE \"{s}\".master_lines ADD COLUMN IF NOT EXISTS type VARCHAR(20) NOT NULL DEFAULT 'physical'"
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    print(f"  ✅ master_lines.type OK ({s})")
+
+    # ── 11. int_line_merge (menggantikan merged_lines + merged_line_details) ──
+    conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS "{s}".int_line_merge (
+            parent_line_id INTEGER NOT NULL
+                             REFERENCES "{s}".master_lines(id) ON DELETE CASCADE,
+            child_line_id  INTEGER NOT NULL
+                             REFERENCES "{s}".master_lines(id) ON DELETE CASCADE,
+            PRIMARY KEY (parent_line_id, child_line_id),
+            CONSTRAINT chk_no_self_merge_{s}
+                CHECK (parent_line_id <> child_line_id)
+        )
+    """))
+    conn.commit()
+    print(f"  ✅ int_line_merge OK ({s})")
+
+    # ── 12. Migrasi data dari merged_lines (jika tabel lama masih ada) ────────
+    try:
+        # Cek apakah tabel lama masih exist
+        result = conn.execute(text(f"""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                 WHERE table_schema = '{s}'
+                   AND table_name   = 'merged_lines'
+            )
+        """))
+        has_old_table = result.scalar()
+
+        if has_old_table:
+            # Migrasikan merged_lines → master_lines dengan type='merged'
+            conn.execute(text(f"""
+                INSERT INTO "{s}".master_lines
+                    (name, code, remarks, type, is_active,
+                     created_at, created_by_id, updated_at, updated_by_id)
+                SELECT ml.name, ml.code, ml.remarks, 'merged', ml.is_active,
+                       ml.created_at, ml.created_by_id, ml.updated_at, ml.updated_by_id
+                FROM   "{s}".merged_lines ml
+                WHERE  NOT EXISTS (
+                    SELECT 1 FROM "{s}".master_lines ln
+                     WHERE ln.name = ml.name AND ln.type = 'merged'
+                )
+            """))
+            conn.commit()
+
+            # Migrasikan merged_line_details → int_line_merge
+            conn.execute(text(f"""
+                INSERT INTO "{s}".int_line_merge (parent_line_id, child_line_id)
+                SELECT new_parent.id AS parent_line_id,
+                       mld.line_id   AS child_line_id
+                FROM   "{s}".merged_line_details mld
+                JOIN   "{s}".merged_lines        old_ml
+                           ON old_ml.id = mld.merged_line_id
+                JOIN   "{s}".master_lines        new_parent
+                           ON new_parent.name = old_ml.name
+                          AND new_parent.type  = 'merged'
+                ON CONFLICT DO NOTHING
+            """))
+            conn.commit()
+            print(f"  ✅ Data migrasi merged_lines → int_line_merge OK ({s})")
+    except Exception as e:
+        conn.rollback()
+        print(f"  ⚠️  Migrasi data lama gagal (mungkin tidak ada): {e}")

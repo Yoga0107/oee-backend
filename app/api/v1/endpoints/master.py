@@ -20,7 +20,9 @@ from app.models.plant_schema import (
     MachineLossLvl1, MachineLossLvl2, MachineLossLvl3,
     MasterMachineLoss,
     MasterShift, MasterFeedCode, MasterLine, MasterStandardThroughput, StandardThroughputLog,
-    MergedLine, MergedLineDetail,
+    IntLineMerge,
+    LINE_TYPE_PHYSICAL,
+    LINE_TYPE_MERGED,
     MasterOutputType, DEFAULT_OUTPUT_TYPES,
 )
 from app.schemas.master import (
@@ -33,7 +35,7 @@ from app.schemas.master import (
     LineCreate, LineUpdate, LineResponse,
     StandardThroughputCreate, StandardThroughputUpdate, StandardThroughputResponse,
     StandardThroughputLogResponse,
-    MergedLineCreate, MergedLineUpdate, MergedLineResponse, MergedLineMemberResponse,
+    MergedLineCreate, MergedLineUpdate, MergedLineResponse, MergedChildResponse,
     OutputTypeCreate, OutputTypeUpdate, OutputTypeResponse,
 )
 
@@ -467,74 +469,210 @@ def delete_standard_throughput(item_id: int, current_user: CurrentUser, plant: C
 
 
 # ════════════════════════════════════════════════════════
-# MERGED LINES
+# MERGED LINES  (self-referential via int_line_merge)
 # ════════════════════════════════════════════════════════
 
-def _build_merged_response(ml: MergedLine) -> dict:
+def _build_merged_response(line: MasterLine) -> dict:
+    """
+    Bangun dict response untuk merged line.
+    `children` = daftar langsung child_line (1 level, bukan rekursif).
+    FE dapat membangun pohon hierarki secara mandiri dari field `line_type`.
+    """
     return {
-        "id": ml.id, "name": ml.name, "code": ml.code, "remarks": ml.remarks,
-        "is_active": ml.is_active,
-        "created_at": ml.created_at, "created_by_id": ml.created_by_id,
-        "updated_at": ml.updated_at, "updated_by_id": ml.updated_by_id,
-        "members": [{"line_id": d.line_id, "line_name": d.line.name, "line_code": d.line.code} for d in ml.details],
+        "id":            line.id,
+        "name":          line.name,
+        "code":          line.code,
+        "remarks":       line.remarks,
+        "type":          line.type,
+        "is_active":     line.is_active,
+        "created_at":    line.created_at,
+        "created_by_id": line.created_by_id,
+        "updated_at":    line.updated_at,
+        "updated_by_id": line.updated_by_id,
+        "children": [
+            {
+                "line_id":   merge.child_line_id,
+                "line_name": merge.child_line.name,
+                "line_code": merge.child_line.code,
+                "line_type": merge.child_line.type,   # 'physical' | 'merged'
+            }
+            for merge in line.child_merges
+        ],
     }
+
+
+def _validate_no_cycle(db: Session, parent_id: int, child_ids: list[int]) -> None:
+    """
+    Pastikan tidak ada siklus: parent tidak boleh menjadi (langsung/tidak langsung)
+    child dari salah satu child_ids yang baru.
+
+    Algoritma BFS menelusuri semua ancestor dari parent_id.
+    Jika parent_id ditemukan di antara descendant child_ids → cycle terdeteksi.
+    """
+    from collections import deque
+    visited: set[int] = set()
+    queue: deque[int] = deque(child_ids)
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+        if current == parent_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Terjadi siklus: line ID {parent_id} tidak boleh menjadi child dari dirinya sendiri (langsung maupun tidak langsung).",
+            )
+        # Tambahkan child-child dari current ke queue
+        child_merges = db.query(IntLineMerge).filter(IntLineMerge.parent_line_id == current).all()
+        for m in child_merges:
+            queue.append(m.child_line_id)
 
 
 @router.get("/merged-lines", response_model=list[MergedLineResponse])
 def get_merged_lines(current_user: CurrentUser, plant: CurrentPlant):
+    """Ambil semua merged line (MasterLine dengan type='merged')."""
     db = _db(plant)
-    return [_build_merged_response(i) for i in db.query(MergedLine).filter(MergedLine.is_active == True).order_by(MergedLine.id).all()]
+    lines = (
+        db.query(MasterLine)
+        .filter(MasterLine.type == LINE_TYPE_MERGED, MasterLine.is_active == True)
+        .order_by(MasterLine.id)
+        .all()
+    )
+    return [_build_merged_response(ln) for ln in lines]
 
 
 @router.get("/merged-lines/{item_id}", response_model=MergedLineResponse)
 def get_merged_line(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    """Ambil satu merged line beserta daftar child-nya."""
     db = _db(plant)
-    item = db.query(MergedLine).filter(MergedLine.id == item_id).first()
-    if not item: raise HTTPException(404, "Merged line not found")
-    return _build_merged_response(item)
+    line = db.query(MasterLine).filter(
+        MasterLine.id == item_id,
+        MasterLine.type == LINE_TYPE_MERGED,
+    ).first()
+    if not line:
+        raise HTTPException(404, "Merged line tidak ditemukan")
+    return _build_merged_response(line)
 
 
 @router.post("/merged-lines", response_model=MergedLineResponse, status_code=201)
 def create_merged_line(payload: MergedLineCreate, current_user: CurrentUser, plant: CurrentPlant):
+    """
+    Buat merged line baru.
+
+    `child_line_ids` boleh berisi:
+    - ID dari line fisik (type='physical')
+    - ID dari merged line (type='merged')  → penggabungan bertingkat
+
+    Contoh bertingkat:
+      LINE_AB  = merge(LINE_A, LINE_B)
+      LINE_CD  = merge(LINE_C, LINE_D)
+      LINE_ABCD = merge(LINE_AB, LINE_CD)  ← child bertipe 'merged'
+    """
     db = _db(plant)
-    if len(payload.line_ids) < 2: raise HTTPException(400, "Minimal 2 line harus dipilih")
-    item = MergedLine(name=payload.name, code=payload.code, remarks=payload.remarks, created_by_id=current_user.id)
-    db.add(item); db.flush()
-    for lid in payload.line_ids:
-        line = db.query(MasterLine).filter(MasterLine.id == lid).first()
-        if not line: db.rollback(); raise HTTPException(404, f"Line {lid} tidak ditemukan")
-        db.add(MergedLineDetail(merged_line_id=item.id, line_id=lid))
-    db.commit(); db.refresh(item)
-    return _build_merged_response(item)
+
+    # 1. Buat record MasterLine dengan type='merged'
+    new_line = MasterLine(
+        plant_id=plant.id,
+        name=payload.name,
+        code=payload.code,
+        remarks=payload.remarks,
+        type=LINE_TYPE_MERGED,
+        created_by_id=current_user.id,
+    )
+    db.add(new_line)
+    db.flush()  # dapatkan new_line.id
+
+    # 2. Validasi setiap child & cek cycle
+    _validate_no_cycle(db, new_line.id, payload.child_line_ids)
+
+    for child_id in payload.child_line_ids:
+        child = db.query(MasterLine).filter(MasterLine.id == child_id).first()
+        if not child:
+            db.rollback()
+            raise HTTPException(404, f"Line ID {child_id} tidak ditemukan")
+        db.add(IntLineMerge(parent_line_id=new_line.id, child_line_id=child_id))
+
+    db.commit()
+    db.refresh(new_line)
+    return _build_merged_response(new_line)
 
 
 @router.put("/merged-lines/{item_id}", response_model=MergedLineResponse)
 def update_merged_line(item_id: int, payload: MergedLineUpdate, current_user: CurrentUser, plant: CurrentPlant):
+    """
+    Update merged line.
+    Jika `child_line_ids` dikirim, seluruh relasi child akan diganti (replace).
+    """
     db = _db(plant)
-    item = db.query(MergedLine).filter(MergedLine.id == item_id).first()
-    if not item: raise HTTPException(404, "Merged line not found")
-    if payload.name is not None: item.name = payload.name
-    if payload.code is not None: item.code = payload.code
-    if payload.remarks is not None: item.remarks = payload.remarks
-    if payload.is_active is not None: item.is_active = payload.is_active
-    if payload.line_ids is not None:
-        if len(payload.line_ids) < 2: raise HTTPException(400, "Minimal 2 line harus dipilih")
-        for d in item.details: db.delete(d)
+    line = db.query(MasterLine).filter(
+        MasterLine.id == item_id,
+        MasterLine.type == LINE_TYPE_MERGED,
+    ).first()
+    if not line:
+        raise HTTPException(404, "Merged line tidak ditemukan")
+
+    if payload.name      is not None: line.name      = payload.name
+    if payload.code      is not None: line.code      = payload.code
+    if payload.remarks   is not None: line.remarks   = payload.remarks
+    if payload.is_active is not None: line.is_active = payload.is_active
+
+    if payload.child_line_ids is not None:
+        # Hapus semua relasi lama
+        db.query(IntLineMerge).filter(IntLineMerge.parent_line_id == item_id).delete()
         db.flush()
-        for lid in payload.line_ids:
-            line = db.query(MasterLine).filter(MasterLine.id == lid).first()
-            if not line: db.rollback(); raise HTTPException(404, f"Line {lid} tidak ditemukan")
-            db.add(MergedLineDetail(merged_line_id=item.id, line_id=lid))
-    item.updated_by_id = current_user.id; db.commit(); db.refresh(item)
-    return _build_merged_response(item)
+
+        # Cek cycle dengan child_ids baru
+        _validate_no_cycle(db, item_id, payload.child_line_ids)
+
+        # Tambahkan relasi baru
+        for child_id in payload.child_line_ids:
+            child = db.query(MasterLine).filter(MasterLine.id == child_id).first()
+            if not child:
+                db.rollback()
+                raise HTTPException(404, f"Line ID {child_id} tidak ditemukan")
+            db.add(IntLineMerge(parent_line_id=item_id, child_line_id=child_id))
+
+    line.updated_by_id = current_user.id
+    db.commit()
+    db.refresh(line)
+    return _build_merged_response(line)
 
 
 @router.delete("/merged-lines/{item_id}", status_code=204)
 def delete_merged_line(item_id: int, current_user: CurrentUser, plant: CurrentPlant):
+    """
+    Soft-delete merged line (is_active = False).
+    Relasi int_line_merge TIDAK dihapus agar histori terjaga.
+    Hard-delete bisa dilakukan via cascade jika diperlukan.
+    """
     db = _db(plant)
-    item = db.query(MergedLine).filter(MergedLine.id == item_id).first()
-    if not item: raise HTTPException(404, "Merged line not found")
-    item.is_active = False; item.updated_by_id = current_user.id; db.commit()
+    line = db.query(MasterLine).filter(
+        MasterLine.id == item_id,
+        MasterLine.type == LINE_TYPE_MERGED,
+    ).first()
+    if not line:
+        raise HTTPException(404, "Merged line tidak ditemukan")
+
+    # Cegah delete jika line ini masih menjadi child dari merged line lain yang aktif
+    parent_count = (
+        db.query(IntLineMerge)
+        .join(MasterLine, MasterLine.id == IntLineMerge.parent_line_id)
+        .filter(
+            IntLineMerge.child_line_id == item_id,
+            MasterLine.is_active == True,
+        )
+        .count()
+    )
+    if parent_count > 0:
+        raise HTTPException(
+            400,
+            f"Line ini masih digunakan sebagai child dari {parent_count} merged line aktif. "
+            "Hapus atau update merged line parent terlebih dahulu.",
+        )
+
+    line.is_active = False
+    line.updated_by_id = current_user.id
+    db.commit()
 
 
 # ════════════════════════════════════════════════════════
@@ -672,7 +810,7 @@ def _collect_changelog(db) -> list[dict]:
                      "action": action, "changed_at": ts, "changed_by_id": uid,
                      "detail": {"l1": l1, "l2": l2, "l3": l3, "remarks": m.remarks, "is_active": m.is_active}})
 
-    for ml in db.query(MergedLine).all():
+    for ml in db.query(MasterLine).filter(MasterLine.type == LINE_TYPE_MERGED).all():
         action, ts, uid = _determine_action(ml.is_active, ml.created_at, ml.updated_at, ml.created_by_id, ml.updated_by_id)
         rows.append({"master": "Merged Line", "record_id": ml.id, "label": ml.name,
                      "action": action, "changed_at": ts, "changed_by_id": uid,

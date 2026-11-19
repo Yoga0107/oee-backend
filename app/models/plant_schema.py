@@ -1,9 +1,9 @@
 from datetime import datetime, time
-from sqlalchemy import (
+from sqlalchemy import (  # type: ignore[reportMissingImports]
     Integer, String, Boolean, DateTime, Time, Float, ForeignKey,
     UniqueConstraint, func, Text, SmallInteger
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
+from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase  # type: ignore[reportMissingImports]
 
 
 class PlantBase(DeclarativeBase):
@@ -97,12 +97,21 @@ class MasterFeedCode(PlantBase):
 
 
 # ─── Line ────────────────────────────────────────────────────────────────────
+# MODIFIKASI: Menambahkan kolom `type` untuk membedakan line fisik vs hasil merge.
+# Semua line (fisik maupun gabungan) disimpan di tabel ini.
+# Relasi penggabungan (termasuk bertingkat) dikelola via IntLineMerge.
+LINE_TYPE_PHYSICAL = "physical"   # Line fisik / asli
+LINE_TYPE_MERGED   = "merged"     # Line hasil penggabungan
+ 
+ 
 class MasterLine(PlantBase):
     __tablename__ = "master_lines"
-
+ 
     id:            Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
     plant_id:      Mapped[int]      = mapped_column(Integer, nullable=False)
     name:          Mapped[str]      = mapped_column(String(100), nullable=False)
+    type:          Mapped[str]      = mapped_column(String(20), nullable=False, default=LINE_TYPE_PHYSICAL)
+    # type: 'physical' = line asli/fisik, 'merged' = line hasil penggabungan
     code:          Mapped[str|None] = mapped_column(String(50))
     remarks:       Mapped[str|None] = mapped_column(String(500))
     is_active:     Mapped[bool]     = mapped_column(Boolean, default=True)
@@ -110,9 +119,70 @@ class MasterLine(PlantBase):
     created_by_id: Mapped[int|None] = mapped_column(Integer, nullable=True)
     updated_at:    Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
     updated_by_id: Mapped[int|None] = mapped_column(Integer, nullable=True)
-
+ 
     standard_throughputs: Mapped[list["MasterStandardThroughput"]] = relationship(
         "MasterStandardThroughput", back_populates="line"
+    )
+ 
+    # Relasi sebagai parent (line ini adalah hasil merge dari children di bawahnya)
+    child_merges: Mapped[list["IntLineMerge"]] = relationship(
+        "IntLineMerge",
+        foreign_keys="IntLineMerge.parent_line_id",
+        back_populates="parent_line",
+        cascade="all, delete-orphan",
+    )
+ 
+    # Relasi sebagai child (line ini adalah anggota dari suatu merged line)
+    parent_merges: Mapped[list["IntLineMerge"]] = relationship(
+        "IntLineMerge",
+        foreign_keys="IntLineMerge.child_line_id",
+        back_populates="child_line",
+    )
+ 
+ 
+# ─── Int Line Merge ───────────────────────────────────────────────────────────
+# BARU: Menggantikan merged_lines + merged_line_details.
+# Self-referential many-to-many pada master_lines.
+# Mendukung penggabungan bertingkat:
+#   LINE_AB  → {LINE_A, LINE_B}
+#   LINE_CD  → {LINE_C, LINE_D}
+#   LINE_ABCD → {LINE_AB, LINE_CD}   ← parent/child keduanya bertipe 'merged'
+class IntLineMerge(PlantBase):
+    """
+    int_line_merge — tabel relasi penggabungan line (self-referential).
+ 
+    parent_line_id : line hasil penggabungan (type = 'merged')
+    child_line_id  : line anggota (type = 'physical' ATAU 'merged')
+ 
+    Contoh penggabungan bertingkat:
+      INSERT (parent=LINE_AB,   child=LINE_A)
+      INSERT (parent=LINE_AB,   child=LINE_B)
+      INSERT (parent=LINE_CD,   child=LINE_C)
+      INSERT (parent=LINE_CD,   child=LINE_D)
+      INSERT (parent=LINE_ABCD, child=LINE_AB)   ← child adalah merged line
+      INSERT (parent=LINE_ABCD, child=LINE_CD)   ← child adalah merged line
+    """
+    __tablename__ = "int_line_merge"
+    __table_args__ = (
+        UniqueConstraint("parent_line_id", "child_line_id", name="uq_line_merge_parent_child"),
+    )
+ 
+    parent_line_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("master_lines.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    child_line_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("master_lines.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+ 
+    parent_line: Mapped["MasterLine"] = relationship(
+        "MasterLine", foreign_keys=[parent_line_id], back_populates="child_merges"
+    )
+    child_line: Mapped["MasterLine"] = relationship(
+        "MasterLine", foreign_keys=[child_line_id], back_populates="parent_merges"
     )
 
 
@@ -160,10 +230,10 @@ class MasterOutputType(PlantBase):
     __tablename__ = "master_output_types"
 
     id:            Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
-    code:          Mapped[str]      = mapped_column(String(50), unique=True, nullable=False)   # e.g. finished_goods
-    name:          Mapped[str]      = mapped_column(String(100), nullable=False)               # e.g. Finished Goods
-    category:      Mapped[str]      = mapped_column(String(50), nullable=False)               # e.g. FG
-    is_good_product: Mapped[bool]   = mapped_column(Boolean, default=False)                   # True = dihitung sbg good product
+    code:          Mapped[str]      = mapped_column(String(50), unique=True, nullable=False)
+    name:          Mapped[str]      = mapped_column(String(100), nullable=False)
+    category:      Mapped[str]      = mapped_column(String(50), nullable=False)
+    is_good_product: Mapped[bool]   = mapped_column(Boolean, default=False)
     sort_order:    Mapped[int]      = mapped_column(Integer, default=0)
     remarks:       Mapped[str|None] = mapped_column(String(500))
     is_active:     Mapped[bool]     = mapped_column(Boolean, default=True)
@@ -250,38 +320,6 @@ class MachineLossInput(PlantBase):
     loss_l2:   Mapped["MachineLossLvl2|None"]    = relationship("MachineLossLvl2", foreign_keys=[loss_l2_id])
     loss_l3:   Mapped["MachineLossLvl3|None"]    = relationship("MachineLossLvl3", foreign_keys=[loss_l3_id])
 
-
-# ─── Merged Line ──────────────────────────────────────────────────────────────
-class MergedLine(PlantBase):
-    __tablename__ = "merged_lines"
-
-    id:            Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name:          Mapped[str]      = mapped_column(String(100), nullable=False)
-    code:          Mapped[str|None] = mapped_column(String(50))
-    remarks:       Mapped[str|None] = mapped_column(String(500))
-    is_active:     Mapped[bool]     = mapped_column(Boolean, default=True)
-    created_at:    Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    created_by_id: Mapped[int|None] = mapped_column(Integer, nullable=True)
-    updated_at:    Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-    updated_by_id: Mapped[int|None] = mapped_column(Integer, nullable=True)
-
-    details: Mapped[list["MergedLineDetail"]] = relationship(
-        "MergedLineDetail", back_populates="merged_line", cascade="all, delete-orphan"
-    )
-
-
-class MergedLineDetail(PlantBase):
-    __tablename__ = "merged_line_details"
-
-    merged_line_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("merged_lines.id", ondelete="CASCADE"), primary_key=True
-    )
-    line_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("master_lines.id", ondelete="CASCADE"), primary_key=True
-    )
-
-    merged_line: Mapped["MergedLine"] = relationship("MergedLine", back_populates="details")
-    line:        Mapped["MasterLine"] = relationship("MasterLine")
 
 # ─── Equipment Tree ───────────────────────────────────────────────────────────
 
